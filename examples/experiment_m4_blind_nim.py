@@ -37,13 +37,13 @@ def run_blind_experiment() -> dict:
 
     # Real engine outputs (no mocks, real host OCR status)
     ctx_a = fscr.run_pipeline(c78['frame_a'], vf='theme,layout,controls,text_bands,ocr,ui_map=44:16')
-    rep_a = fscr.format_pipeline_report(ctx_a, max_chars=5000)
+    rep_a = fscr.format_pipeline_report(ctx_a, max_chars=6500)
 
     ctx_diff = fscr.run_pipeline(c78['frame_b'], vf=f'layout,controls,ocr,ui_diff={c78["frame_a"]}')
-    rep_diff = fscr.format_pipeline_report(ctx_diff, max_chars=5000)
+    rep_diff = fscr.format_pipeline_report(ctx_diff, max_chars=6500)
 
     ctx_amb = fscr.run_pipeline(c13['frame_b'], vf=f'layout,controls,ui_diff={c13["frame_a"]}')
-    rep_amb = fscr.format_pipeline_report(ctx_amb, max_chars=3500)
+    rep_amb = fscr.format_pipeline_report(ctx_amb, max_chars=4500)
 
     # Strip any local filesystem paths just to guarantee 0 indirect file paths in prompt
     prompt = (

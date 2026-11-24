@@ -214,17 +214,52 @@ class M4AdversarialTests(unittest.TestCase):
         self.assertIn(fdiff.CLS_NEW, cls_set, tracks)
 
     def test_case12_ocr_absent_never_invents_labels(self):
-        """Case 12: when real Tesseract is absent, returns OCR_ABSENT + NO_TEXT_EVIDENCE and 0 invented texts."""
+        """Case 12: when requested OCR backend is absent, returns OCR_ABSENT + NO_TEXT_EVIDENCE and 0 invented texts."""
         tess, _ = focr.detect_tesseract_engine()
         if tess is not None:
-            self.skipTest('tesseract is installed on this host; OCR_ABSENT path tested directly below')
+            self.skipTest('tesseract is installed on this host')
         info = self.manifest['cases']['pr_dark']
-        ctx = fscr.run_pipeline(info['path'], vf='layout,controls,ocr')
+        ctx = fscr.run_pipeline(info['path'], vf='layout,controls,ocr=backend=tesseract')
         self.assertEqual(ctx.artifacts['ocr']['status'], focr.OCR_ABSENT)
         for c in ctx.artifacts['controls']['controls']:
             self.assertIsNone(c['text'])
             self.assertEqual(c['association'], focr.ASSOC_NONE)
             self.assertEqual(c['association_reason'], focr.OCR_ABSENT)
+
+    def test_gate_b_real_ocr_no_mocks_pr_dark_light_and_uidiff(self):
+        """Gate B REAL OCR (ZERO MOCKS): reads rendered labels and binds them to controls & temporal tracks."""
+        rap_ok, _ = focr.detect_rapidocr_engine()
+        tess, _ = focr.detect_tesseract_engine()
+        if not rap_ok and not tess:
+            self.skipTest('no local OCR engine installed')
+
+        for theme in ('dark', 'light'):
+            info = self.manifest['cases'][f'pr_{theme}']
+            ctx = fscr.run_pipeline(info['path'], vf='theme,layout,controls,ocr')
+            oc = ctx.artifacts['ocr']
+            self.assertEqual(oc['status'], focr.OCR_OBSERVED, oc)
+            self.assertNotEqual(oc['engine'], 'TEST_SYNTHETIC_OCR')
+
+            ctls = ctx.artifacts['controls']['controls']
+            by_norm = {focr.normalize_text(c.get('text') or ''): c for c in ctls if c.get('text')}
+            self.assertIn('merge pull request', by_norm, ctls)
+            self.assertEqual(by_norm['merge pull request']['association'], focr.ASSOC_INSIDE)
+            self.assertIn('save', by_norm, ctls)
+            self.assertIn('cancel', by_norm, ctls)
+            self.assertIn('target branch', by_norm, ctls)
+            self.assertEqual(by_norm['target branch']['association'], focr.ASSOC_LABEL)
+
+        # Real OCR inside temporal ui_diff (Case 7+8): Merge pull request keeps track AND text across color change!
+        c78 = self.manifest['cases']['modal_and_color_change']
+        ctx_d = fscr.run_pipeline(c78['frame_b'], vf=f'layout,controls,ocr,ui_diff={c78["frame_a"]}')
+        tracks = ctx_d.artifacts['ui_diff']['tracking']['tracks']
+        color_ch = [e for e in tracks if fdiff.CLS_COLOR_CHANGED in e['flags']]
+        self.assertEqual(len(color_ch), 1, tracks)
+        self.assertEqual(focr.normalize_text(color_ch[0]['frame_a']['text'] or ''), 'merge pull request')
+        self.assertEqual(focr.normalize_text(color_ch[0]['frame_b']['text'] or ''), 'merge pull request')
+        # Dismiss button inside new modal read via real OCR!
+        new_texts = {focr.normalize_text(e['frame_b']['text'] or '') for e in tracks if e['classification'] == fdiff.CLS_NEW}
+        self.assertIn('dismiss', new_texts, tracks)
 
     def test_case13_ambiguous_match_and_ambiguous_external_label(self):
         """Case 13: visually identical controls force AMBIGUOUS_MATCH & equidistant label forces AMBIGUOUS_ASSOCIATION."""

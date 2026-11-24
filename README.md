@@ -11,7 +11,7 @@
 
 ### M3/M4. Motor de filtros componibles estilo `ffmpeg` para Capturas de Pantalla (`flowsight_screen.py`)
 Pipeline determinista `-vf "f1=...,f2,..."` (OpenCV + NumPy + SciPy + Pillow):
-- **10 filtros con metadata declarativa (`--filters`):** `crop`, `theme`, `layout`, `controls` (con `click=(cx,cy)`), `text_bands` (geométrico sin OCR), `ocr` (Tesseract local + asociación geométrica `TEXT_INSIDE`/`LABEL_ASSOCIATED`/`AMBIGUOUS_ASSOCIATION`/`NO_TEXT_EVIDENCE`, fail-closed `OCR_ABSENT`), `ui_map` (wireframe ASCII compacto), `ui_diff` (**basado en identidad temporal** con asignación global óptima, tracks persistentes `K0..Kn`, 9 clasificaciones y detección de `AMBIGUOUS_MATCH`), `vlm_probe` (contrato M4-C **desactivado por defecto**) y `blocks`.
+- **10 filtros con metadata declarativa (`--filters`):** `crop`, `theme`, `layout`, `controls` (con `click=(cx,cy)`), `text_bands` (geométrico sin OCR), `ocr` (OCR local real CPU vía `tesseract` o `rapidocr-onnxruntime` PP-OCRv4 + asociación geométrica `TEXT_INSIDE`/`LABEL_ASSOCIATED`/`AMBIGUOUS_ASSOCIATION`/`NO_TEXT_EVIDENCE`, fail-closed `OCR_ABSENT`), `ui_map` (wireframe ASCII compacto), `ui_diff` (**basado en identidad temporal** con asignación global óptima, tracks persistentes `K0..Kn`, 9 clasificaciones y detección de `AMBIGUOUS_MATCH`), `vlm_probe` (contrato M4-C **desactivado por defecto**) y `blocks`.
 
 ```bash
 # Ver catálogo declarativo de filtros (estilo `ffmpeg -filters`)
@@ -117,7 +117,7 @@ python3 flowsight.py export-flowpaint sprite.sqlite sprite.flowpaint
 - Verificación de integridad SHA-256 por canal (`r_sha256`, `g_sha256`, `b_sha256`, `rgb_sha256`, `rgba_sha256`) al abrir y reconstruir.
 - Escritura atómica vía archivo temporal + `os.replace`; lectura en SQLite `?mode=ro`; nunca sobrescribe sin `--force`.
 - Determinismo byte a byte en índices SQLite, resúmenes L0 y salidas de consulta.
-- **Límites explícitos (`NOT_DEMONSTRATED`):** no hace reconocimiento semántico de fotos/objetos humanos, no hace OCR, no cuantiza imágenes >64 colores en `--mode visual`, ni predice la ejecución dinámica multi-tick de la VM de FLOW sin ejecutarla.
+- **Límites explícitos (`NOT_DEMONSTRATED`):** el modo lossless (`flowsight.py`) no hace reconocimiento semántico de fotos/objetos humanos, no hace OCR (el OCR vive en `flowsight_screen.py` M4), no cuantiza imágenes >64 colores en `--mode visual`, ni predice la ejecución dinámica multi-tick de la VM de FLOW sin ejecutarla.
 
 ---
 

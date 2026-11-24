@@ -650,22 +650,23 @@ def _f_text_bands(ctx: FilterContext, params: dict[str, str]) -> None:
 
 @register_filter(
     'ocr',
-    'Local OCR (Tesseract) + geometric text-control association (TEXT_INSIDE/LABEL_ASSOCIATED/AMBIGUOUS/NO_TEXT_EVIDENCE)',
-    'ocr[=lang=eng:min_conf=60]',
+    'Local OCR (Tesseract or RapidOCR ONNX) + geometric text-control association (TEXT_INSIDE/LABEL_ASSOCIATED/AMBIGUOUS/NO_TEXT_EVIDENCE)',
+    'ocr[=lang=eng:min_conf=60:backend=auto]',
     inputs=('rgb', 'optional:layout', 'optional:controls'),
     outputs=('ocr', 'text_control_association'),
-    optional_deps=('tesseract',),
+    optional_deps=('tesseract', 'rapidocr-onnxruntime'),
     requires_network=False,
     requires_gpu=False,
     deterministic=True,
     coord_space='global',
     provenance='DEMONSTRATED (OCR_OBSERVED) / UNCERTAIN (OCR_UNCERTAIN) / ABSENT (OCR_ABSENT)',
-    degradations='returns OCR_ABSENT when tesseract is missing; never invents text',
+    degradations='returns OCR_ABSENT when no local OCR backend is installed; never invents text',
 )
 def _f_ocr(ctx: FilterContext, params: dict[str, str]) -> None:
     lang = params.get('lang') or params.get('_0') or 'eng'
     min_conf = float(_int_param(params, 'min_conf', 1, 60, 0, 100))
     psm = _int_param(params, 'psm', None, 11, 3, 13)
+    backend = params.get('backend') or params.get('_2') or 'auto'
     res = focr.run_ocr(
         ctx.rgb,
         offset_x=ctx.offset_x,
@@ -674,6 +675,7 @@ def _f_ocr(ctx: FilterContext, params: dict[str, str]) -> None:
         lang=lang,
         min_observed_conf=min_conf,
         psm=psm,
+        backend=backend,
         provider=ctx.ocr_provider,
     )
     # Backward-compatible alias `lines` pointing to `items`
@@ -796,7 +798,7 @@ def _f_ui_map(ctx: FilterContext, params: dict[str, str]) -> None:
     'ui_diff=path_to_before.png',
     inputs=('rgb', 'optional:layout', 'optional:controls', 'optional:ocr'),
     outputs=('ui_diff',),
-    optional_deps=('tesseract',),
+    optional_deps=('tesseract', 'rapidocr-onnxruntime'),
     requires_network=False,
     requires_gpu=False,
     deterministic=True,

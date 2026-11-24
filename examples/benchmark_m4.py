@@ -39,10 +39,12 @@ def run_m4_benchmark() -> dict:
     corpus_dir = OUT_DIR / 'corpus'
     manifest = corpus_m4.build_corpus(corpus_dir)
     tess_path, tess_ver = focr.detect_tesseract_engine()
+    rap_ok, rap_ver = focr.detect_rapidocr_engine()
+    active_ocr_engine = tess_ver if tess_path else (rap_ver if rap_ok else 'absent')
 
     tracemalloc.start()
 
-    # 1. Single-frame PR dark (fast mode vs OCR mode)
+    # 1. Single-frame PR dark (fast mode vs real OCR mode)
     pr_dark = manifest['cases']['pr_dark']
     ctx_fast = fscr.run_pipeline(pr_dark['path'], vf='theme,layout,controls,text_bands,ui_map=48:20')
     rep_fast = fscr.format_pipeline_report(ctx_fast)
@@ -50,6 +52,66 @@ def run_m4_benchmark() -> dict:
     ctx_ocr = fscr.run_pipeline(pr_dark['path'], vf='theme,layout,controls,text_bands,ocr,ui_map=48:20')
     rep_ocr = fscr.format_pipeline_report(ctx_ocr)
     (OUT_DIR / 'example_ocr_pipeline.txt').write_text(rep_ocr + '\n', encoding='utf-8')
+
+    # Real OCR CER/WER & real end-to-end text-control association P/R on pr_dark + pr_light
+    real_ocr_metrics = 'NOT_DEMONSTRATED (no local OCR backend installed)'
+    if ctx_ocr.artifacts['ocr']['status'] in (focr.OCR_OBSERVED, focr.OCR_UNCERTAIN):
+        per_case = []
+        tp_real = 0
+        fp_real = 0
+        gt_total_real = 0
+        cer_vals = []
+        wer_vals = []
+        for theme_key in ('pr_dark', 'pr_light'):
+            cinfo = manifest['cases'][theme_key]
+            cctx = ctx_ocr if theme_key == 'pr_dark' else fscr.run_pipeline(cinfo['path'], vf='theme,layout,controls,ocr')
+            det_ctls = cctx.artifacts['controls']['controls']
+            gt_total_real += len(cinfo['controls'])
+            matched_gt = set()
+            for dc in det_ctls:
+                if dc.get('association') not in (focr.ASSOC_INSIDE, focr.ASSOC_LABEL):
+                    continue
+                # Find best overlapping ground-truth control by IoU
+                best_gi, best_iou = None, 0.0
+                for gi, gc in enumerate(cinfo['controls']):
+                    ov = fdiff._iou(gc['bbox'], dc['global_bbox'])
+                    if ov > best_iou:
+                        best_iou, best_gi = ov, gi
+                if best_gi is not None and best_iou >= 0.50:
+                    gc = cinfo['controls'][best_gi]
+                    cw = focr.compute_cer_wer(gc['expected_text'], dc.get('text') or '')
+                    cer_vals.append(cw['cer'])
+                    wer_vals.append(cw['wer'])
+                    assoc_ok = (dc['association'] == gc['expected_assoc']) and (cw['cer'] <= 0.15)
+                    if assoc_ok and best_gi not in matched_gt:
+                        tp_real += 1
+                        matched_gt.add(best_gi)
+                    else:
+                        fp_real += 1
+                    per_case.append({
+                        'case': theme_key,
+                        'control': gc['name'],
+                        'expected': gc['expected_text'],
+                        'observed': dc.get('text'),
+                        'conf': dc.get('text_confidence'),
+                        'expected_assoc': gc['expected_assoc'],
+                        'observed_assoc': dc.get('association'),
+                        'cer': cw['cer'],
+                        'wer': cw['wer'],
+                    })
+                else:
+                    fp_real += 1
+        real_ocr_metrics = {
+            'engine': ctx_ocr.artifacts['ocr']['engine'],
+            'mean_cer': round(sum(cer_vals) / max(1, len(cer_vals)), 4),
+            'mean_wer': round(sum(wer_vals) / max(1, len(wer_vals)), 4),
+            'association_precision': round(tp_real / max(1, tp_real + fp_real), 4),
+            'association_recall': round(tp_real / max(1, gt_total_real), 4),
+            'tp': tp_real,
+            'fp': fp_real,
+            'gt_total': gt_total_real,
+            'details': per_case,
+        }
 
     # Measure bbox IoU vs ground truth on pr_dark
     gt_boxes = [c['bbox'] for c in pr_dark['controls']]
@@ -147,8 +209,9 @@ def run_m4_benchmark() -> dict:
 
     report = {
         'tesseract_installed': tess_path is not None,
-        'tesseract_engine': tess_ver,
-        'ocr_cer_wer_real': 'NOT_DEMONSTRATED (tesseract binary absent on host PATH)' if tess_path is None else 'measured',
+        'rapidocr_installed': rap_ok,
+        'active_ocr_engine': active_ocr_engine,
+        'ocr_cer_wer_real': real_ocr_metrics,
         'synthetic_1280x720_fast': {
             'layout_ms': _stage_ms(ctx_fast.trace, 'layout'),
             'controls_ms': _stage_ms(ctx_fast.trace, 'controls'),

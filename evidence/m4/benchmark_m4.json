@@ -1,13 +1,135 @@
 {
   "tesseract_installed": false,
-  "tesseract_engine": "absent",
-  "ocr_cer_wer_real": "NOT_DEMONSTRATED (tesseract binary absent on host PATH)",
+  "rapidocr_installed": true,
+  "active_ocr_engine": "rapidocr-onnxruntime installed (PP-OCRv4 ONNX)",
+  "ocr_cer_wer_real": {
+    "engine": "rapidocr-onnxruntime installed (PP-OCRv4 ONNX)",
+    "mean_cer": 0.0,
+    "mean_wer": 0.0,
+    "association_precision": 1.0,
+    "association_recall": 1.0,
+    "tp": 10,
+    "fp": 0,
+    "gt_total": 10,
+    "details": [
+      {
+        "case": "pr_dark",
+        "control": "email_input",
+        "expected": "Email:",
+        "observed": "Email:",
+        "conf": 99.9,
+        "expected_assoc": "LABEL_ASSOCIATED",
+        "observed_assoc": "LABEL_ASSOCIATED",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_dark",
+        "control": "branch_input",
+        "expected": "Target Branch",
+        "observed": "Target Branch",
+        "conf": 98.4,
+        "expected_assoc": "LABEL_ASSOCIATED",
+        "observed_assoc": "LABEL_ASSOCIATED",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_dark",
+        "control": "merge_btn",
+        "expected": "Merge pull request",
+        "observed": "Merge pull request",
+        "conf": 99.9,
+        "expected_assoc": "TEXT_INSIDE",
+        "observed_assoc": "TEXT_INSIDE",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_dark",
+        "control": "save_btn",
+        "expected": "Save",
+        "observed": "Save",
+        "conf": 99.3,
+        "expected_assoc": "TEXT_INSIDE",
+        "observed_assoc": "TEXT_INSIDE",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_dark",
+        "control": "cancel_btn",
+        "expected": "Cancel",
+        "observed": "Cancel",
+        "conf": 99.8,
+        "expected_assoc": "TEXT_INSIDE",
+        "observed_assoc": "TEXT_INSIDE",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_light",
+        "control": "email_input",
+        "expected": "Email:",
+        "observed": "Email:",
+        "conf": 99.9,
+        "expected_assoc": "LABEL_ASSOCIATED",
+        "observed_assoc": "LABEL_ASSOCIATED",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_light",
+        "control": "branch_input",
+        "expected": "Target Branch",
+        "observed": "Target Branch",
+        "conf": 97.9,
+        "expected_assoc": "LABEL_ASSOCIATED",
+        "observed_assoc": "LABEL_ASSOCIATED",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_light",
+        "control": "merge_btn",
+        "expected": "Merge pull request",
+        "observed": "Merge pull request",
+        "conf": 99.9,
+        "expected_assoc": "TEXT_INSIDE",
+        "observed_assoc": "TEXT_INSIDE",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_light",
+        "control": "save_btn",
+        "expected": "Save",
+        "observed": "Save",
+        "conf": 99.3,
+        "expected_assoc": "TEXT_INSIDE",
+        "observed_assoc": "TEXT_INSIDE",
+        "cer": 0.0,
+        "wer": 0.0
+      },
+      {
+        "case": "pr_light",
+        "control": "cancel_btn",
+        "expected": "Cancel",
+        "observed": "Cancel",
+        "conf": 99.8,
+        "expected_assoc": "TEXT_INSIDE",
+        "observed_assoc": "TEXT_INSIDE",
+        "cer": 0.0,
+        "wer": 0.0
+      }
+    ]
+  },
   "synthetic_1280x720_fast": {
-    "layout_ms": 13.3,
-    "controls_ms": 8.42,
-    "text_bands_ms": 3.43,
-    "total_ms": 33.32,
-    "report_chars": 3694,
+    "layout_ms": 13.39,
+    "controls_ms": 11.06,
+    "text_bands_ms": 4.31,
+    "total_ms": 36.14,
+    "report_chars": 3696,
     "mean_bbox_iou_vs_gt": 0.9678,
     "per_control_iou": [
       0.9187,
@@ -18,11 +140,11 @@
     ]
   },
   "synthetic_1280x720_with_ocr_stage": {
-    "ocr_status": "OCR_ABSENT",
-    "ocr_ms": 0.48,
-    "association_ms": 0.04,
-    "total_ms": 30.83,
-    "report_chars": 4118
+    "ocr_status": "OCR_OBSERVED",
+    "ocr_ms": 802.26,
+    "association_ms": 1.17,
+    "total_ms": 838.2,
+    "report_chars": 4590
   },
   "geometric_association_benchmark_synthetic_ocr": {
     "precision": 1.0,
@@ -30,11 +152,11 @@
     "tp": 5,
     "fp": 0,
     "gt_total": 5,
-    "elapsed_ms": 1.45
+    "elapsed_ms": 1.14
   },
   "temporal_matching_metrics": {
-    "ui_diff_ms": 63.77,
-    "diff_report_chars": 4054,
+    "ui_diff_ms": 358.14,
+    "diff_report_chars": 4685,
     "case78_modal_plus_color": {
       "fp_removed_controls": 0,
       "color_changed_detected": 1,
@@ -50,22 +172,22 @@
       1080
     ],
     "fast_mode_ms": {
-      "layout": 51.99,
-      "controls": 38.61,
-      "text_bands": 48.23,
-      "total": 146.84,
+      "layout": 22.02,
+      "controls": 34.22,
+      "text_bands": 45.12,
+      "total": 111.88,
       "report_chars": 6500
     },
     "ocr_mode_ms": {
-      "ocr_status": "OCR_ABSENT",
-      "ocr": 0.56,
-      "association": 0.09,
-      "total": 117.39
+      "ocr_status": "OCR_OBSERVED",
+      "ocr": 1770.11,
+      "association": 60.29,
+      "total": 1871.35
     }
   },
   "memory_bytes": {
-    "current": 29632737,
-    "peak": 62733491,
-    "peak_mib": 59.83
+    "current": 33374197,
+    "peak": 146116382,
+    "peak_mib": 139.35
   }
 }

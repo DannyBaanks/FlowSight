@@ -35,6 +35,115 @@ ASSOC_NONE = 'NO_TEXT_EVIDENCE'
 
 DEFAULT_MIN_OBSERVED_CONF = 60.0
 TESSERACT_CONF_SCALE = 'tesseract_0_100_uncalibrated (NOT calibrated probability)'
+RAPIDOCR_CONF_SCALE = 'rapidocr_0_100_uncalibrated (raw 0..1 x100; NOT calibrated probability)'
+
+_RAPIDOCR_SINGLETON: Any = None
+
+
+def detect_rapidocr_engine() -> tuple[bool, str]:
+    """Return (available, version_string) for local rapidocr-onnxruntime."""
+    try:
+        import rapidocr_onnxruntime as rmod
+        ver = getattr(rmod, '__version__', 'installed')
+        return True, f'rapidocr-onnxruntime {ver} (PP-OCRv4 ONNX)'
+    except ImportError:
+        return False, 'absent'
+
+
+def _get_rapidocr_instance():
+    global _RAPIDOCR_SINGLETON
+    if _RAPIDOCR_SINGLETON is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _RAPIDOCR_SINGLETON = RapidOCR()
+    return _RAPIDOCR_SINGLETON
+
+
+def _run_rapidocr(
+    rgb: np.ndarray,
+    offset_x: int,
+    offset_y: int,
+    source_frame: str,
+    lang: str,
+    min_observed_conf: float,
+) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    avail, engine_ver = detect_rapidocr_engine()
+    if not avail:
+        return {
+            'status': OCR_ABSENT,
+            'engine': 'none',
+            'confidence_scale': RAPIDOCR_CONF_SCALE,
+            'source_frame': source_frame,
+            'lang': lang,
+            'preprocessing': 'none',
+            'detail': 'rapidocr-onnxruntime not installed',
+            'note': 'OCR_ABSENT means text could not be read; it does NOT prove the screen has no text.',
+            'items': [],
+            'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+    try:
+        engine = _get_rapidocr_instance()
+        # RapidOCR expects BGR or RGB numpy array (PIL/RGB works cleanly; pass BGR for cv2 native consistency)
+        bgr = rgb[:, :, ::-1].copy()
+        result, _elapse = engine(bgr)
+    except Exception as e:
+        return {
+            'status': OCR_ERROR,
+            'engine': engine_ver,
+            'confidence_scale': RAPIDOCR_CONF_SCALE,
+            'source_frame': source_frame,
+            'lang': lang,
+            'preprocessing': 'native_bgr',
+            'detail': f'rapidocr execution failed: {e}',
+            'items': [],
+            'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
+    items: list[dict[str, Any]] = []
+    for entry in (result or []):
+        # entry = [quad_points, text, score_0_to_1]
+        if not entry or len(entry) < 3:
+            continue
+        pts, raw_txt, raw_score = entry[0], str(entry[1]).strip(), float(entry[2])
+        if not raw_txt:
+            continue
+        xs = [int(round(p[0])) for p in pts]
+        ys = [int(round(p[1])) for p in pts]
+        x0, x1 = max(0, min(xs)), max(xs)
+        y0, y1 = max(0, min(ys)), max(ys)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        conf = round(max(0.0, min(100.0, raw_score * 100.0)), 1)
+        st = OCR_OBSERVED if conf >= min_observed_conf else OCR_UNCERTAIN
+        items.append({
+            'text': raw_txt,
+            'bbox': [offset_x + x0, offset_y + y0, offset_x + x1, offset_y + y1],
+            'confidence': conf,
+            'min_word_confidence': conf,
+            'confidence_scale': RAPIDOCR_CONF_SCALE,
+            'engine': engine_ver,
+            'source_frame': source_frame,
+            'status': st,
+        })
+
+    items.sort(key=lambda r: (r['bbox'][1] // 10, r['bbox'][0]))
+    for idx, it in enumerate(items):
+        it['id'] = f'O{idx}'
+
+    overall = OCR_OBSERVED if any(it['status'] == OCR_OBSERVED for it in items) else (
+        OCR_UNCERTAIN if items else OCR_OBSERVED
+    )
+    return {
+        'status': overall,
+        'engine': engine_ver,
+        'confidence_scale': RAPIDOCR_CONF_SCALE,
+        'source_frame': source_frame,
+        'lang': lang,
+        'preprocessing': 'native_bgr',
+        'detail': f'{len(items)} line(s) extracted via RapidOCR; empty result does NOT prove absence of text',
+        'items': items,
+        'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+    }
 
 
 def normalize_text(text: str) -> str:
@@ -94,11 +203,16 @@ def run_ocr(
     min_observed_conf: float = DEFAULT_MIN_OBSERVED_CONF,
     psm: int = 11,
     timeout_s: float = 30.0,
+    backend: str = 'auto',
     provider: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Run local Tesseract OCR (or an injected test provider, explicitly tagged) over an RGB array.
+    """Run local OCR (`tesseract` or `rapidocr-onnxruntime`) over an RGB array.
 
-    Never fabricates text when Tesseract is unavailable.
+    `backend`:
+      - 'auto' (default): uses `tesseract` if on PATH, else `rapidocr-onnxruntime` if installed, else `OCR_ABSENT`.
+      - 'tesseract': require local tesseract binary (returns `OCR_ABSENT` if missing).
+      - 'rapidocr': require local rapidocr-onnxruntime (returns `OCR_ABSENT` if missing).
+    Never fabricates text when no local OCR engine is available.
     """
     t0 = time.perf_counter()
     if provider is not None:
@@ -106,8 +220,16 @@ def run_ocr(
         res.setdefault('elapsed_ms', round((time.perf_counter() - t0) * 1000.0, 2))
         return res
 
+    bmode = (backend or 'auto').strip().lower()
+    if bmode == 'rapidocr':
+        return _run_rapidocr(rgb, offset_x, offset_y, source_frame, lang, min_observed_conf)
+
     tess, engine_ver = detect_tesseract_engine()
     if not tess:
+        if bmode == 'auto':
+            rap_ok, _ = detect_rapidocr_engine()
+            if rap_ok:
+                return _run_rapidocr(rgb, offset_x, offset_y, source_frame, lang, min_observed_conf)
         return {
             'status': OCR_ABSENT,
             'engine': 'none',
@@ -115,7 +237,9 @@ def run_ocr(
             'source_frame': source_frame,
             'lang': lang,
             'preprocessing': 'none',
-            'detail': 'tesseract binary not installed on PATH; install tesseract-ocr to enable real OCR',
+            'detail': 'no local OCR engine available (tesseract absent on PATH' + (
+                '; rapidocr-onnxruntime absent)' if bmode == 'auto' else ')'
+            ),
             'note': 'OCR_ABSENT means text could not be read; it does NOT prove the screen has no text.',
             'items': [],
             'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),

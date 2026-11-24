@@ -37,9 +37,10 @@ cd "/home/danny/Development/ISyCo Git/FlowSight"
 PYTHONPATH="/home/danny/Development/ISyCo Git/FLOW:." python3 -m unittest tests/test_blocks_and_mcp.py tests/test_screen_filters.py tests/test_m4_adversarial.py -v
 ```
 
-## Paso 4 — Activación opcional de OCR real (Tesseract)
+## Paso 4 — Backends locales de OCR
 
-Si deseas habilitar la lectura OCR real en el filtro `ocr` (actualmente `OCR_ABSENT`):
+- **Activo en este host (CPU, sin red):** `rapidocr-onnxruntime==1.4.4` (PP-OCRv4 ONNX) usado automáticamente por `ocr` (`backend=auto` o `backend=rapidocr`).
+- **Opcional adicional (`tesseract`):** si también deseas habilitar Tesseract como backend alternativo (`backend=tesseract`):
 
 ```bash
 sudo apt update && sudo apt install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa
