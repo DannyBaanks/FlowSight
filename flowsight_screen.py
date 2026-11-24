@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+"""FlowSight M3 — ffmpeg-style composable filter pipeline for screenshots.
+
+Architecture inspired by `ffmpeg -vf "filter1=arg,filter2=...,filter3"`:
+  Input PNG/JPG/WEBP (read-only) -> FilterContext -> composable deterministic filters
+  -> structured bounded UI report (panels, clickable controls, text bands, wireframe
+     ASCII map, optional OCR, UI diff, and block splitting/stitching).
+
+Epistemic contract:
+  - Purely deterministic computer vision (OpenCV + NumPy + Pillow); zero LLM inside filters.
+  - Reports MEASURED geometry/color/contrast/edge facts (`DEMONSTRATED`): panel dividers,
+    bounding boxes, clickable centers (cx, cy), accent/bordered widget candidates, and
+    high-frequency horizontal text bands.
+  - Never invents app names, button labels without OCR, or semantic identities.
+  - Optional `ocr` filter fails closed (`OCR_BACKEND=ABSENT`) when tesseract is unavailable.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, Callable
+
+import cv2
+import numpy as np
+from PIL import Image, UnidentifiedImageError
+
+import flowsight_blocks as fb
+
+SCHEMA_SCREEN = 'flowsight-screen-v1'
+MAX_SCREEN_DIM = 8192
+
+
+class FilterDeny(ValueError):
+    pass
+
+
+@dataclass
+class FilterContext:
+    """Mutable pipeline carrier (never mutates original image file on disk)."""
+
+    source_path: str
+    source_name: str
+    source_sha256: str
+    full_w: int
+    full_h: int
+    rgb: np.ndarray                 # current working RGB uint8 (H, W, 3)
+    offset_x: int = 0               # global x offset of current crop
+    offset_y: int = 0               # global y offset of current crop
+    artifacts: dict[str, Any] = field(default_factory=dict)
+    trace: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def w(self) -> int:
+        return int(self.rgb.shape[1])
+
+    @property
+    def h(self) -> int:
+        return int(self.rgb.shape[0])
+
+    @property
+    def global_bbox(self) -> list[int]:
+        return [self.offset_x, self.offset_y, self.offset_x + self.w, self.offset_y + self.h]
+
+    def to_global(self, x0: int, y0: int, x1: int, y1: int) -> list[int]:
+        return [self.offset_x + x0, self.offset_y + y0, self.offset_x + x1, self.offset_y + y1]
+
+
+@dataclass(frozen=True)
+class FilterSpec:
+    name: str
+    summary: str
+    syntax: str
+    fn: Callable[[FilterContext, dict[str, str]], None]
+
+
+FILTERS: dict[str, FilterSpec] = {}
+
+
+def register_filter(name: str, summary: str, syntax: str):
+    def _dec(fn: Callable[[FilterContext, dict[str, str]], None]):
+        FILTERS[name] = FilterSpec(name=name, summary=summary, syntax=syntax, fn=fn)
+        return fn
+    return _dec
+
+
+def _hex(rgb: tuple[int, int, int] | list[int] | np.ndarray) -> str:
+    return f'#{int(rgb[0]):02x}{int(rgb[1]):02x}{int(rgb[2]):02x}'
+
+
+def _box_contains(outer: list[int], inner: list[int], min_overlap: float = 0.65) -> bool:
+    ix0 = max(outer[0], inner[0])
+    iy0 = max(outer[1], inner[1])
+    ix1 = min(outer[2], inner[2])
+    iy1 = min(outer[3], inner[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return False
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    area = max(1, (inner[2] - inner[0]) * (inner[3] - inner[1]))
+    return (inter / area) >= min_overlap
+
+
+def _load_screen_rgb(path: str | Path) -> tuple[np.ndarray, str, str]:
+    p = Path(path)
+    if not p.is_file():
+        raise FilterDeny(f'image not found: {p}')
+    raw = p.read_bytes()
+    sha = hashlib.sha256(raw).hexdigest()
+    try:
+        with Image.open(p) as im:
+            w, h = im.size
+            if not (8 <= w <= MAX_SCREEN_DIM and 8 <= h <= MAX_SCREEN_DIM):
+                raise FilterDeny(f'screen {w}x{h} outside 8..{MAX_SCREEN_DIM}')
+            arr = np.asarray(im.convert('RGB'), dtype=np.uint8)
+            return arr, sha, p.name
+    except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as e:
+        raise FilterDeny(f'cannot decode image: {e}') from e
+
+
+# ============================================================================
+# Filter graph parser (`-vf "crop=0:0:960:540,theme,layout,controls,ui_map=48:20"`)
+# ============================================================================
+
+def parse_vf(vf: str) -> list[tuple[str, dict[str, str]]]:
+    """Parse ffmpeg-style comma-separated filter chain."""
+    if not vf or not vf.strip():
+        raise FilterDeny('empty filter chain (-vf)')
+    steps: list[tuple[str, dict[str, str]]] = []
+    # Split on commas outside quotes
+    parts: list[str] = []
+    cur: list[str] = []
+    in_q = False
+    for ch in vf:
+        if ch in ("'", '"'):
+            in_q = not in_q
+            continue
+        if ch == ',' and not in_q:
+            tok = ''.join(cur).strip()
+            if tok:
+                parts.append(tok)
+            cur = []
+        else:
+            cur.append(ch)
+    tail = ''.join(cur).strip()
+    if tail:
+        parts.append(tail)
+
+    for part in parts:
+        if '=' in part:
+            name, raw_args = part.split('=', 1)
+            name = name.strip().lower()
+            raw_args = raw_args.strip()
+        else:
+            name, raw_args = part.strip().lower(), ''
+        if name not in FILTERS:
+            raise FilterDeny(f'unknown filter {name!r}; available: {sorted(FILTERS)}')
+        params: dict[str, str] = {}
+        if raw_args:
+            # Supports both key=val:key2=val2 and positional colons (e.g. crop=x:y:w:h or ui_map=48:20)
+            tokens = raw_args.split(':')
+            pos_idx = 0
+            for tok in tokens:
+                if '=' in tok:
+                    k, v = tok.split('=', 1)
+                    params[k.strip()] = v.strip()
+                else:
+                    params[f'_{pos_idx}'] = tok.strip()
+                    pos_idx += 1
+        steps.append((name, params))
+    return steps
+
+
+def _int_param(params: dict[str, str], key: str, pos: int | None, default: int, lo: int, hi: int) -> int:
+    raw = params.get(key)
+    if raw is None and pos is not None:
+        raw = params.get(f'_{pos}')
+    if raw is None or raw == '':
+        return default
+    try:
+        v = int(raw, 10)
+    except ValueError:
+        raise FilterDeny(f'parameter {key} must be int, got {raw!r}') from None
+    if not (lo <= v <= hi):
+        raise FilterDeny(f'parameter {key}={v} outside [{lo},{hi}]')
+    return v
+
+
+# ============================================================================
+# Built-in Screenshot Filters (ffmpeg-style composable blocks)
+# ============================================================================
+
+@register_filter(
+    'crop',
+    'Crop working frame preserving exact global screen coordinates',
+    'crop=x:y:w:h (or crop=x=0:y=0:w=960:h=540)',
+)
+def _f_crop(ctx: FilterContext, params: dict[str, str]) -> None:
+    x = _int_param(params, 'x', 0, 0, 0, ctx.w - 1)
+    y = _int_param(params, 'y', 1, 0, 0, ctx.h - 1)
+    w = _int_param(params, 'w', 2, ctx.w - x, 8, ctx.w - x)
+    h = _int_param(params, 'h', 3, ctx.h - y, 8, ctx.h - y)
+    ctx.rgb = ctx.rgb[y:y + h, x:x + w].copy()
+    ctx.offset_x += x
+    ctx.offset_y += y
+    ctx.artifacts['crop'] = {'global_bbox': ctx.global_bbox, 'size': [ctx.w, ctx.h]}
+
+
+@register_filter(
+    'theme',
+    'Classify UI polarity (dark/light/mixed), background surface, and accent colors',
+    'theme (no args)',
+)
+def _f_theme(ctx: FilterContext, params: dict[str, str]) -> None:
+    # Subsample for speed on 1920x1080 (<10ms)
+    step = max(1, min(ctx.w, ctx.h) // 240)
+    sub = ctx.rgb[::step, ::step, :]
+    luma = 0.299 * sub[:, :, 0] + 0.587 * sub[:, :, 1] + 0.114 * sub[:, :, 2]
+    med_luma = float(np.median(luma))
+    mean_luma = float(np.mean(luma))
+    dark_pct = float(np.mean(luma < 85.0) * 100.0)
+    light_pct = float(np.mean(luma > 180.0) * 100.0)
+    if dark_pct >= 55.0:
+        polarity = 'dark'
+    elif light_pct >= 55.0:
+        polarity = 'light'
+    else:
+        polarity = 'mixed'
+
+    # Dominant surface colors via 16-level per-channel histogram (fast, exact binning)
+    q = (sub // 16) * 16 + 8
+    flat = q.reshape(-1, 3)
+    codes = (flat[:, 0].astype(np.int32) << 16) | (flat[:, 1].astype(np.int32) << 8) | flat[:, 2].astype(np.int32)
+    uniq, cnts = np.unique(codes, return_counts=True)
+    order = np.argsort(-cnts)
+    total = int(flat.shape[0])
+    surfaces = []
+    accents = []
+    for idx in order[:40]:
+        c = int(uniq[idx])
+        r, g, b = (c >> 16) & 255, (c >> 8) & 255, c & 255
+        pct = round(int(cnts[idx]) * 100.0 / total, 1)
+        fam = fb._hsv_family(r, g, b)
+        mx, mn = max(r, g, b), min(r, g, b)
+        sat = (mx - mn) / max(1, mx)
+        entry = {'hex': _hex((r, g, b)), 'rgb': [r, g, b], 'family': fam, 'pct': pct}
+        if len(surfaces) < 5:
+            surfaces.append(entry)
+        if sat >= 0.42 and mx >= 80 and pct >= 0.1 and len(accents) < 6:
+            accents.append(entry)
+
+    ctx.artifacts['theme'] = {
+        'polarity': polarity,
+        'median_luma': round(med_luma, 1),
+        'mean_luma': round(mean_luma, 1),
+        'dark_pct': round(dark_pct, 1),
+        'light_pct': round(light_pct, 1),
+        'dominant_surfaces': surfaces,
+        'accent_colors': accents,
+    }
+
+
+def _merge_1d_lines(indices: np.ndarray, min_gap: int = 8) -> list[int]:
+    if indices.size == 0:
+        return []
+    groups = [[int(indices[0])]]
+    for v in indices[1:]:
+        iv = int(v)
+        if iv - groups[-1][-1] <= min_gap:
+            groups[-1].append(iv)
+        else:
+            groups.append([iv])
+    return [g[len(g) // 2] for g in groups]
+
+
+@register_filter(
+    'layout',
+    'Detect structural UI dividers (H/V splits) and panel/pane containers with global bboxes',
+    'layout[=max_panels=12]',
+)
+def _f_layout(ctx: FilterContext, params: dict[str, str]) -> None:
+    max_panels = _int_param(params, 'max_panels', 0, 12, 2, 32)
+    h, w = ctx.h, ctx.w
+    gray = cv2.cvtColor(ctx.rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    # Row-wise & col-wise edge continuity: real UI dividers create consistent transitions
+    # across a large fraction (>=42%) of the width or height.
+    dy = np.abs(np.diff(gray, axis=0))  # (H-1, W)
+    dx = np.abs(np.diff(gray, axis=1))  # (H, W-1)
+
+    h_cov = np.mean(dy >= 10.0, axis=1)  # fraction of columns with vertical contrast at row y
+    v_cov = np.mean(dx >= 10.0, axis=0)  # fraction of rows with horizontal contrast at col x
+
+    # Also check color-uniform strip transitions (flat bar edges)
+    h_idx = np.where(h_cov >= 0.42)[0] + 1
+    v_idx = np.where(v_cov >= 0.42)[0] + 1
+
+    # Ignore edges within 4px of border
+    h_idx = h_idx[(h_idx >= 12) & (h_idx <= h - 12)]
+    v_idx = v_idx[(v_idx >= 12) & (v_idx <= w - 12)]
+    h_divs = _merge_1d_lines(h_idx, min_gap=max(12, h // 45))[:8]
+    v_divs = _merge_1d_lines(v_idx, min_gap=max(12, w // 45))[:8]
+
+    ys = [0] + h_divs + [h]
+    xs = [0] + v_divs + [w]
+
+    # Build grid cells from dividers, then merge adjacent cells that share nearly identical
+    # background color AND lack a strong divider between them on that local segment.
+    cells = []
+    for ri in range(len(ys) - 1):
+        y0, y1 = ys[ri], ys[ri + 1]
+        if y1 - y0 < 10:
+            continue
+        for ci in range(len(xs) - 1):
+            x0, x1 = xs[ci], xs[ci + 1]
+            if x1 - x0 < 16:
+                continue
+            patch = ctx.rgb[y0:y1, x0:x1]
+            # Background estimate = median RGB of patch
+            med_rgb = [int(np.median(patch[:, :, c])) for c in range(3)]
+            luma = round(0.299 * med_rgb[0] + 0.587 * med_rgb[1] + 0.114 * med_rgb[2], 1)
+            gpatch = gray[y0:y1, x0:x1]
+            std_l = round(float(np.std(gpatch)), 1)
+            area_pct = round((x1 - x0) * (y1 - y0) * 100.0 / (w * h), 1)
+            cells.append({
+                'local': [x0, y0, x1, y1],
+                'ri': ri, 'ci': ci,
+                'bg_rgb': med_rgb,
+                'luma': luma,
+                'std_luma': std_l,
+                'area_pct': area_pct,
+            })
+
+    # Merge horizontal spans when top/bottom bands are uniform across V-dividers (e.g. topbar/statusbar)
+    merged_rows = []
+    by_row: dict[int, list[dict]] = {}
+    for c in cells:
+        by_row.setdefault(c['ri'], []).append(c)
+    for ri in sorted(by_row):
+        row_cells = sorted(by_row[ri], key=lambda z: z['local'][0])
+        cur = row_cells[0]
+        for nxt in row_cells[1:]:
+            y0, y1 = cur['local'][1], cur['local'][3]
+            seam_x = cur['local'][2]
+            local_seam = float(np.mean(dx[y0:y1, max(0, seam_x - 1)] >= 10.0)) if seam_x < w else 1.0
+            cdiff = sum(abs(cur['bg_rgb'][k] - nxt['bg_rgb'][k]) for k in range(3)) / 3.0
+            if local_seam < 0.35 and cdiff <= 18.0:
+                cur['local'][2] = nxt['local'][2]
+                cur['area_pct'] = round(cur['area_pct'] + nxt['area_pct'], 1)
+            else:
+                merged_rows.append(cur)
+                cur = nxt
+        merged_rows.append(cur)
+
+    # Positional geometric hint (pure geometry, NEVER an app/semantic claim)
+    panels = []
+    merged_rows.sort(key=lambda z: (-z['area_pct'], z['local'][1], z['local'][0]))
+    for idx, p in enumerate(merged_rows[:max_panels]):
+        x0, y0, x1, y1 = p['local']
+        pw, ph = x1 - x0, y1 - y0
+        if y0 <= 12 and ph <= h * 0.14 and pw >= w * 0.55:
+            pos_hint = 'top-bar-band'
+        elif y1 >= h - 12 and ph <= h * 0.12 and pw >= w * 0.55:
+            pos_hint = 'bottom-bar-band'
+        elif x0 <= 12 and pw <= w * 0.32 and ph >= h * 0.45:
+            pos_hint = 'left-sidebar-band'
+        elif x1 >= w - 12 and pw <= w * 0.32 and ph >= h * 0.45:
+            pos_hint = 'right-sidebar-band'
+        elif p['area_pct'] >= 25.0:
+            pos_hint = 'main-pane'
+        else:
+            pos_hint = 'sub-pane'
+        panels.append({
+            'id': f'P{idx}',
+            'global_bbox': ctx.to_global(x0, y0, x1, y1),
+            'size': [pw, ph],
+            'area_pct': p['area_pct'],
+            'bg_hex': _hex(p['bg_rgb']),
+            'bg_family': fb._hsv_family(*p['bg_rgb']),
+            'luma': p['luma'],
+            'std_luma': p['std_luma'],
+            'position_hint': pos_hint,
+        })
+
+    ctx.artifacts['layout'] = {
+        'h_dividers_global_y': [ctx.offset_y + y for y in h_divs],
+        'v_dividers_global_x': [ctx.offset_x + x for x in v_divs],
+        'panels': panels,
+        'total_panels_detected': len(merged_rows),
+    }
+
+
+@register_filter(
+    'controls',
+    'Detect clickable UI control candidates (accent buttons, bordered inputs/cards, badges) with click centers',
+    'controls[=max=24]',
+)
+def _f_controls(ctx: FilterContext, params: dict[str, str]) -> None:
+    max_controls = _int_param(params, 'max', 0, 24, 1, 100)
+    h, w = ctx.h, ctx.w
+    hsv = cv2.cvtColor(ctx.rgb, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(ctx.rgb, cv2.COLOR_RGB2GRAY)
+    panels = ctx.artifacts.get('layout', {}).get('panels', [])
+
+    candidates: list[dict[str, Any]] = []
+
+    # 1. Accent-colored filled rectangles/pills (buttons, primary CTAs, alert banners, badges)
+    # High saturation AND non-black value
+    sat_mask = ((hsv[:, :, 1] >= 85) & (hsv[:, :, 2] >= 70)).astype(np.uint8) * 255
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    sat_closed = cv2.morphologyEx(sat_mask, cv2.MORPH_CLOSE, k_close)
+    cnts, _ = cv2.findContours(sat_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in cnts:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if bw < 18 or bh < 14 or bw > w * 0.85 or bh > h * 0.45:
+            continue
+        if area < 300:
+            continue
+        fill_ratio = float(cv2.contourArea(cnt)) / max(1.0, float(area))
+        if fill_ratio < 0.70:
+            continue
+        patch = ctx.rgb[y:y + bh, x:x + bw]
+        med = [int(np.median(patch[:, :, c])) for c in range(3)]
+        # Internal horizontal contrast -> likely text/icon label inside button
+        gpatch = gray[y:y + bh, x:x + bw].astype(np.float32)
+        inner_dx = np.abs(np.diff(gpatch[2:-2, 2:-2], axis=1)) if (bh > 6 and bw > 6) else np.zeros((1, 1))
+        has_label = bool(np.mean(inner_dx >= 28.0) >= 0.025)
+        kind = 'badge' if (bw < 64 and bh < 32) else 'accent-control'
+        candidates.append({
+            'local': [x, y, x + bw, y + bh],
+            'kind': kind,
+            'hex': _hex(med),
+            'family': fb._hsv_family(*med),
+            'fill_ratio': round(fill_ratio, 2),
+            'has_inner_contrast': has_label,
+            'score': area * (1.5 if has_label else 1.0),
+        })
+
+    # 2. Sharp bordered rectangular boxes (inputs, search bars, secondary buttons, modal cards)
+    edges = cv2.Canny(gray, 35, 110)
+    k_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges_d = cv2.dilate(edges, k_dil, iterations=1)
+    cnts2, _ = cv2.findContours(edges_d, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in cnts2:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if bw < 48 or bh < 20 or bw > w * 0.80 or bh > h * 0.50:
+            continue
+        if area < 1200 or area > w * h * 0.35:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.025 * peri, True)
+        if not (4 <= len(approx) <= 8):
+            continue
+        rect_ratio = float(cv2.contourArea(cnt)) / max(1.0, float(area))
+        if rect_ratio < 0.84:
+            continue
+        # Verify border is actually distinct from its immediate outside margin
+        patch = ctx.rgb[y + 2:y + bh - 2, x + 2:x + bw - 2] if (bh > 6 and bw > 6) else ctx.rgb[y:y + bh, x:x + bw]
+        med = [int(np.median(patch[:, :, c])) for c in range(3)]
+        gpatch = gray[y:y + bh, x:x + bw].astype(np.float32)
+        inner_dx = np.abs(np.diff(gpatch[3:-3, 3:-3], axis=1)) if (bh > 8 and bw > 8) else np.zeros((1, 1))
+        has_label = bool(np.mean(inner_dx >= 24.0) >= 0.015)
+        aspect = bw / max(1.0, float(bh))
+        if bh <= 52 and aspect >= 2.6:
+            kind = 'input-or-bar-box'
+        elif bh <= 60 and bw <= 280:
+            kind = 'bordered-control'
+        else:
+            kind = 'card-or-dialog'
+        candidates.append({
+            'local': [x, y, x + bw, y + bh],
+            'kind': kind,
+            'hex': _hex(med),
+            'family': fb._hsv_family(*med),
+            'fill_ratio': round(rect_ratio, 2),
+            'has_inner_contrast': has_label,
+            'score': area * (1.2 if kind != 'card-or-dialog' else 0.7),
+        })
+
+    # Non-maximum suppression (deduplicate overlapping detections IoU >= 0.65; prefer accent-control)
+    candidates.sort(key=lambda c: (0 if 'accent' in c['kind'] else 1, -c['score']))
+    kept: list[dict[str, Any]] = []
+    for cand in candidates:
+        lx0, ly0, lx1, ly1 = cand['local']
+        la = (lx1 - lx0) * (ly1 - ly0)
+        dup = False
+        for prev in kept:
+            px0, py0, px1, py1 = prev['local']
+            ix0, iy0 = max(lx0, px0), max(ly0, py0)
+            ix1, iy1 = min(lx1, px1), min(ly1, py1)
+            if ix1 > ix0 and iy1 > iy0:
+                inter = (ix1 - ix0) * (iy1 - iy0)
+                pa = (px1 - px0) * (py1 - py0)
+                iou = inter / max(1, la + pa - inter)
+                if iou >= 0.60:
+                    dup = True
+                    break
+        if not dup:
+            kept.append(cand)
+
+    # Sort top-to-bottom, left-to-right for human/agent readability
+    kept = kept[:max_controls]
+    kept.sort(key=lambda c: (c['local'][1] // 16, c['local'][0]))
+
+    controls = []
+    for i, c in enumerate(kept):
+        gb = ctx.to_global(*c['local'])
+        cx = (gb[0] + gb[2]) // 2
+        cy = (gb[1] + gb[3]) // 2
+        inside = None
+        for p in panels:
+            if _box_contains(p['global_bbox'], gb, min_overlap=0.70):
+                inside = p['id']
+                break
+        controls.append({
+            'id': f'W{i}',
+            'kind': c['kind'],
+            'global_bbox': gb,
+            'size': [gb[2] - gb[0], gb[3] - gb[1]],
+            'click_center': [cx, cy],
+            'hex': c['hex'],
+            'family': c['family'],
+            'has_inner_contrast': c['has_inner_contrast'],
+            'inside_panel': inside,
+        })
+
+    ctx.artifacts['controls'] = {
+        'total_detected': len(kept),
+        'controls': controls,
+    }
+
+
+@register_filter(
+    'text_bands',
+    'Detect geometric horizontal text line bands (no OCR required; pure contrast/stroke frequency)',
+    'text_bands[=max=35]',
+)
+def _f_text_bands(ctx: FilterContext, params: dict[str, str]) -> None:
+    max_bands = _int_param(params, 'max', 0, 35, 1, 150)
+    h, w = ctx.h, ctx.w
+    gray = cv2.cvtColor(ctx.rgb, cv2.COLOR_RGB2GRAY)
+
+    # Text strokes create strong horizontal gradients (vertical glyph stems)
+    gx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+    abs_gx = cv2.convertScaleAbs(gx)
+    _, bin_gx = cv2.threshold(abs_gx, 45, 255, cv2.THRESH_BINARY)
+
+    # Connect letters into word/line bands horizontally, keeping lines vertically separated
+    k_line = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3))
+    dil = cv2.dilate(bin_gx, k_line, iterations=1)
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
+    clean = cv2.morphologyEx(dil, cv2.MORPH_OPEN, k_open)
+
+    cnts, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    panels = ctx.artifacts.get('layout', {}).get('panels', [])
+    controls = ctx.artifacts.get('controls', {}).get('controls', [])
+
+    raw_bands = []
+    for cnt in cnts:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bh < 7 or bh > 54 or bw < 20:
+            continue
+        if bw / max(1.0, float(bh)) < 1.3:
+            continue
+        # Measure horizontal transition density inside band to reject single vertical borders
+        sub_bin = bin_gx[y:y + bh, x:x + bw]
+        row_trans = np.sum(np.abs(np.diff((sub_bin > 0).astype(np.int8), axis=1)), axis=1)
+        med_trans = float(np.median(row_trans))
+        if med_trans < 4.0:
+            continue
+        sub_g = gray[y:y + bh, x:x + bw]
+        contrast = int(np.percentile(sub_g, 95) - np.percentile(sub_g, 5))
+        if contrast < 40:
+            continue
+        raw_bands.append({
+            'local': [x, y, x + bw, y + bh],
+            'transitions': round(med_trans, 1),
+            'contrast': contrast,
+        })
+
+    raw_bands.sort(key=lambda b: (b['local'][1] // 10, b['local'][0]))
+    bands = []
+    for i, b in enumerate(raw_bands[:max_bands]):
+        gb = ctx.to_global(*b['local'])
+        inside_p = next((p['id'] for p in panels if _box_contains(p['global_bbox'], gb, 0.65)), None)
+        inside_w = next((c['id'] for c in controls if _box_contains(c['global_bbox'], gb, 0.55)), None)
+        bands.append({
+            'id': f'T{i}',
+            'global_bbox': gb,
+            'size': [gb[2] - gb[0], gb[3] - gb[1]],
+            'transitions': b['transitions'],
+            'contrast': b['contrast'],
+            'inside_panel': inside_p,
+            'inside_control': inside_w,
+        })
+
+    ctx.artifacts['text_bands'] = {
+        'total_detected': len(raw_bands),
+        'shown': len(bands),
+        'bands': bands,
+    }
+
+
+@register_filter(
+    'ocr',
+    'Optional OCR filter (uses local tesseract if installed; fail-closed ABSENT otherwise)',
+    'ocr[=lang=eng]',
+)
+def _f_ocr(ctx: FilterContext, params: dict[str, str]) -> None:
+    tess = shutil.which('tesseract')
+    if not tess:
+        ctx.artifacts['ocr'] = {
+            'status': 'ABSENT',
+            'detail': 'tesseract binary not installed on PATH; install tesseract-ocr to enable text reading (no hallucinated OCR)',
+            'lines': [],
+        }
+        return
+    lang = params.get('lang') or params.get('_0') or 'eng'
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.png') as tf:
+        Image.fromarray(ctx.rgb, mode='RGB').save(tf.name, format='PNG')
+        proc = subprocess.run(
+            [tess, tf.name, 'stdout', '-l', lang, '--psm', '11', 'tsv'],
+            capture_output=True, text=True, timeout=30,
+        )
+    if proc.returncode != 0:
+        ctx.artifacts['ocr'] = {'status': 'ERROR', 'detail': proc.stderr.strip()[:200], 'lines': []}
+        return
+    # Group TSV words by (block, par, line)
+    grouped: dict[tuple[str, str, str], list[dict]] = {}
+    for ln in proc.stdout.splitlines()[1:]:
+        cols = ln.split('\t')
+        if len(cols) < 12:
+            continue
+        txt = cols[11].strip()
+        try:
+            conf = float(cols[10])
+            x, y, bw, bh = int(cols[6]), int(cols[7]), int(cols[8]), int(cols[9])
+        except ValueError:
+            continue
+        if not txt or conf < 35.0:
+            continue
+        key = (cols[2], cols[3], cols[4])
+        grouped.setdefault(key, []).append({'x0': x, 'y0': y, 'x1': x + bw, 'y1': y + bh, 'text': txt, 'conf': conf})
+
+    lines_out = []
+    for words in grouped.values():
+        x0 = min(w['x0'] for w in words)
+        y0 = min(w['y0'] for w in words)
+        x1 = max(w['x1'] for w in words)
+        y1 = max(w['y1'] for w in words)
+        text = ' '.join(w['text'] for w in words)
+        conf = round(sum(w['conf'] for w in words) / len(words), 1)
+        lines_out.append({'global_bbox': ctx.to_global(x0, y0, x1, y1), 'text': text, 'conf': conf})
+    lines_out.sort(key=lambda r: (r['global_bbox'][1] // 10, r['global_bbox'][0]))
+    ctx.artifacts['ocr'] = {'status': 'OK', 'backend': tess, 'lang': lang, 'lines': lines_out[:60]}
+
+
+@register_filter(
+    'ui_map',
+    'Render compact ASCII wireframe schematic of layout dividers, controls, and text bands',
+    'ui_map[=cols:rows] (default 48:20)',
+)
+def _f_ui_map(ctx: FilterContext, params: dict[str, str]) -> None:
+    cols = _int_param(params, 'cols', 0, 48, 16, 80)
+    rows = _int_param(params, 'rows', 1, 20, 8, 40)
+    h, w = ctx.h, ctx.w
+    ox, oy = ctx.offset_x, ctx.offset_y
+
+    # Base brightness map ('.' dark, ' ' light)
+    small = cv2.resize(ctx.rgb, (cols, rows), interpolation=cv2.INTER_AREA)
+    luma = 0.299 * small[:, :, 0] + 0.587 * small[:, :, 1] + 0.114 * small[:, :, 2]
+    canvas = [['.' if luma[r, c] < 128 else ' ' for c in range(cols)] for r in range(rows)]
+
+    def gx_to_c(gx: int) -> int:
+        return max(0, min(cols - 1, int((gx - ox) * cols / max(1, w))))
+
+    def gy_to_r(gy: int) -> int:
+        return max(0, min(rows - 1, int((gy - oy) * rows / max(1, h))))
+
+    # 1. Text bands ('=')
+    for tb in ctx.artifacts.get('text_bands', {}).get('bands', []):
+        x0, y0, x1, y1 = tb['global_bbox']
+        r0, r1 = gy_to_r(y0), gy_to_r(max(y0, y1 - 1))
+        c0, c1 = gx_to_c(x0), gx_to_c(max(x0, x1 - 1))
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                canvas[r][c] = '='
+
+    # 2. Controls ('[###]' for accent controls, '[...]' for bordered boxes)
+    for ctl in ctx.artifacts.get('controls', {}).get('controls', []):
+        x0, y0, x1, y1 = ctl['global_bbox']
+        r0, r1 = gy_to_r(y0), gy_to_r(max(y0, y1 - 1))
+        c0, c1 = gx_to_c(x0), gx_to_c(max(x0, x1 - 1))
+        fill = '#' if 'accent' in ctl['kind'] or ctl['kind'] == 'badge' else '+'
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                if c == c0 and c1 > c0:
+                    canvas[r][c] = '['
+                elif c == c1 and c1 > c0:
+                    canvas[r][c] = ']'
+                else:
+                    canvas[r][c] = fill
+
+    # 3. Structural dividers ('-' and '|' and '+')
+    lay = ctx.artifacts.get('layout', {})
+    for gy in lay.get('h_dividers_global_y', []):
+        r = gy_to_r(gy)
+        for c in range(cols):
+            canvas[r][c] = '-'
+    for gx in lay.get('v_dividers_global_x', []):
+        c = gx_to_c(gx)
+        for r in range(rows):
+            canvas[r][c] = '+' if canvas[r][c] == '-' else '|'
+
+    ctx.artifacts['ui_map'] = {
+        'size': [cols, rows],
+        'legend': 'bg: .=dark space=light | dividers: - | + | text_band: = | control: [#] accent / [+] box',
+        'lines': [''.join(row) for row in canvas],
+    }
+
+
+@register_filter(
+    'ui_diff',
+    'Compare current screen against a reference screenshot, grouping changed UI regions by panel & control',
+    'ui_diff=path_to_before.png',
+)
+def _f_ui_diff(ctx: FilterContext, params: dict[str, str]) -> None:
+    ref_path = params.get('ref') or params.get('_0')
+    if not ref_path:
+        raise FilterDeny('ui_diff requires reference image path (ui_diff=/path/to/before.png)')
+    ref_full, ref_sha, ref_name = _load_screen_rgb(ref_path)
+    if (ref_full.shape[1], ref_full.shape[0]) != (ctx.full_w, ctx.full_h):
+        raise FilterDeny(
+            f'ui_diff requires same full size: ref {ref_full.shape[1]}x{ref_full.shape[0]} vs {ctx.full_w}x{ctx.full_h}'
+        )
+    ref_crop = ref_full[ctx.offset_y:ctx.offset_y + ctx.h, ctx.offset_x:ctx.offset_x + ctx.w]
+    delta = np.mean(np.abs(ctx.rgb.astype(np.int16) - ref_crop.astype(np.int16)), axis=2)
+    mask = (delta >= 12.0).astype(np.uint8) * 255
+    changed_px = int(np.count_nonzero(mask))
+    total_px = ctx.w * ctx.h
+
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+    merged = cv2.dilate(mask, k, iterations=1)
+    cnts, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    panels = ctx.artifacts.get('layout', {}).get('panels', [])
+    controls = ctx.artifacts.get('controls', {}).get('controls', [])
+    regions = []
+    for cnt in cnts:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw * bh < 64:
+            continue
+        sub_m = mask[y:y + bh, x:x + bw] > 0
+        c_cnt = int(np.count_nonzero(sub_m))
+        if c_cnt == 0:
+            continue
+        old_med = [int(np.median(ref_crop[y:y + bh, x:x + bw][sub_m, ch])) for ch in range(3)]
+        new_med = [int(np.median(ctx.rgb[y:y + bh, x:x + bw][sub_m, ch])) for ch in range(3)]
+        gb = ctx.to_global(x, y, x + bw, y + bh)
+        in_p = next((p['id'] for p in panels if _box_contains(p['global_bbox'], gb, 0.55)), None)
+        hit_w = [c['id'] for c in controls if _box_contains(gb, c['global_bbox'], 0.40) or _box_contains(c['global_bbox'], gb, 0.40)]
+        regions.append({
+            'global_bbox': gb,
+            'changed_pixels': c_cnt,
+            'old_hex': _hex(old_med),
+            'new_hex': _hex(new_med),
+            'inside_panel': in_p,
+            'overlapping_controls': hit_w[:4],
+        })
+    regions.sort(key=lambda r: -r['changed_pixels'])
+    for i, r in enumerate(regions[:12]):
+        r['id'] = f'D{i}'
+
+    ctx.artifacts['ui_diff'] = {
+        'reference_name': ref_name,
+        'reference_sha256': ref_sha[:16],
+        'changed_pixels': changed_px,
+        'changed_pct': round(changed_px * 100.0 / total_px, 2),
+        'regions': regions[:12],
+        'total_regions': len(regions),
+    }
+
+
+@register_filter(
+    'blocks',
+    'Attach M2 halves/quarters block partitioning + cross-seam stitch summary to the screen pipeline',
+    'blocks[=quarters|halves_h|halves_v:colors=10]',
+)
+def _f_blocks(ctx: FilterContext, params: dict[str, str]) -> None:
+    split = params.get('split') or params.get('_0') or 'quarters'
+    k = _int_param(params, 'colors', 1, 10, 2, 24)
+    sess = fb.map_image_blocks(
+        ctx.source_path,
+        split=split,
+        palette_k=k,
+        box=tuple(ctx.global_bbox),
+    )
+    st = fb.stitch_blocks(sess['session_id'])
+    ctx.artifacts['blocks'] = {
+        'session_id': sess['session_id'],
+        'split': split,
+        'quantization_error': sess['quantization_error'],
+        'seams': st['seams'],
+        'cross_seam_regions': [r for r in st['unified_regions'] if r['crosses_seam']][:8],
+    }
+
+
+# ============================================================================
+# Pipeline execution & compact bounded formatting
+# ============================================================================
+
+def run_pipeline(image_path: str | Path, vf: str = 'theme,layout,controls,text_bands,ui_map=48:20') -> FilterContext:
+    """Execute an ffmpeg-style filter graph over a screenshot (read-only)."""
+    steps = parse_vf(vf)
+    rgb, sha, name = _load_screen_rgb(image_path)
+    ctx = FilterContext(
+        source_path=str(Path(image_path).resolve()),
+        source_name=name,
+        source_sha256=sha,
+        full_w=int(rgb.shape[1]),
+        full_h=int(rgb.shape[0]),
+        rgb=rgb,
+    )
+    for fname, params in steps:
+        t0 = time.perf_counter()
+        FILTERS[fname].fn(ctx, params)
+        ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        ctx.trace.append({'filter': fname, 'params': params, 'ms': ms})
+    return ctx
+
+
+def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
+    total_ms = round(sum(t['ms'] for t in ctx.trace), 2)
+    chain = ' -> '.join(f'{t["filter"]}({t["ms"]}ms)' for t in ctx.trace)
+    out = [
+        f'FLOWSIGHT SCREEN v1 | {ctx.source_name} ({ctx.full_w}x{ctx.full_h}) | scope={ctx.global_bbox} | SHA256={ctx.source_sha256[:16]}',
+        f'PIPELINE ({total_ms}ms): {chain}',
+        'Coordinates: origin top-left (0,0); x right, y down; bboxes [x0,y0,x1,y1) EXCLUSIVE; click=(cx,cy).',
+    ]
+
+    if 'theme' in ctx.artifacts:
+        th = ctx.artifacts['theme']
+        surf = ', '.join(f'{s["hex"]}({s["family"]}):{s["pct"]}%' for s in th['dominant_surfaces'][:4])
+        acc = ', '.join(f'{a["hex"]}({a["family"]}):{a["pct"]}%' for a in th['accent_colors'][:4]) or '(none)'
+        out.append(
+            f'THEME: polarity={th["polarity"]} median_luma={th["median_luma"]} '
+            f'(dark={th["dark_pct"]}% light={th["light_pct"]}%)'
+        )
+        out.append(f'  surfaces: {surf}')
+        out.append(f'  accents:  {acc}')
+
+    if 'layout' in ctx.artifacts:
+        lay = ctx.artifacts['layout']
+        out.append(
+            f'LAYOUT (DEMONSTRATED dividers & panes): H_div_y={lay["h_dividers_global_y"]} '
+            f'V_div_x={lay["v_dividers_global_x"]} | panels={len(lay["panels"])}/{lay["total_panels_detected"]}:'
+        )
+        for p in lay['panels']:
+            out.append(
+                f'  {p["id"]:<3s} {p["position_hint"]:<18s} bbox={p["global_bbox"]} '
+                f'({p["size"][0]}x{p["size"][1]}, {p["area_pct"]}%) bg={p["bg_hex"]}({p["bg_family"]}) L={p["luma"]}'
+            )
+
+    if 'controls' in ctx.artifacts:
+        ct = ctx.artifacts['controls']
+        out.append(f'CONTROLS (DEMONSTRATED clickable candidates, total={ct["total_detected"]}):')
+        for c in ct['controls']:
+            lbl = 'has_inner_text/icon' if c['has_inner_contrast'] else 'flat'
+            out.append(
+                f'  {c["id"]:<3s} {c["kind"]:<16s} bbox={c["global_bbox"]} click={tuple(c["click_center"])} '
+                f'color={c["hex"]}({c["family"]}) panel={c["inside_panel"]} [{lbl}]'
+            )
+
+    if 'text_bands' in ctx.artifacts:
+        tb = ctx.artifacts['text_bands']
+        out.append(
+            f'TEXT BANDS (GEOMETRIC ONLY, no OCR; showing {tb["shown"]}/{tb["total_detected"]}):'
+        )
+        for b in tb['bands'][:20]:
+            loc = f'control={b["inside_control"]}' if b['inside_control'] else f'panel={b["inside_panel"]}'
+            out.append(
+                f'  {b["id"]:<3s} bbox={b["global_bbox"]} ({b["size"][0]}x{b["size"][1]}) '
+                f'trans={b["transitions"]} contrast={b["contrast"]} {loc}'
+            )
+        if tb['total_detected'] > 20:
+            out.append(f'  [TRUNCATED {tb["total_detected"] - 20} additional text bands; use crop=x:y:w:h to inspect]')
+
+    if 'ocr' in ctx.artifacts:
+        oc = ctx.artifacts['ocr']
+        if oc['status'] != 'OK':
+            out.append(f'OCR: status={oc["status"]} ({oc["detail"]})')
+        else:
+            out.append(f'OCR (backend={oc["backend"]}, lang={oc["lang"]}, lines={len(oc["lines"])}):')
+            for ln in oc['lines'][:25]:
+                out.append(f'  bbox={ln["global_bbox"]} conf={ln["conf"]} text={ln["text"]!r}')
+
+    if 'ui_map' in ctx.artifacts:
+        um = ctx.artifacts['ui_map']
+        out.append(f'UI WIREFRAME MAP {um["size"][0]}x{um["size"][1]} ({um["legend"]}):')
+        for ln in um['lines']:
+            out.append('  ' + ln)
+
+    if 'ui_diff' in ctx.artifacts:
+        df = ctx.artifacts['ui_diff']
+        out.append(
+            f'UI DIFF vs {df["reference_name"]}: changed={df["changed_pixels"]}px ({df["changed_pct"]}%) '
+            f'regions={len(df["regions"])}/{df["total_regions"]}:'
+        )
+        for r in df['regions']:
+            out.append(
+                f'  {r["id"]:<3s} bbox={r["global_bbox"]} px={r["changed_pixels"]} '
+                f'{r["old_hex"]}->{r["new_hex"]} panel={r["inside_panel"]} controls={r["overlapping_controls"]}'
+            )
+
+    if 'blocks' in ctx.artifacts:
+        bk = ctx.artifacts['blocks']
+        seams = ', '.join(f'{s["pair"]}:{s["continuity_pct"]}%' for s in bk['seams'])
+        out.append(
+            f'BLOCKS session={bk["session_id"]} split={bk["split"]} '
+            f'PSNR={bk["quantization_error"]["psnr_db"]}dB seams=[{seams}] '
+            f'cross_seam={len(bk["cross_seam_regions"])}'
+        )
+
+    text = '\n'.join(out)
+    if len(text) > max_chars:
+        suf = '\n[TRUNCATED: narrow scope with crop=x:y:w:h or select fewer filters in -vf]'
+        text = text[:max(0, max_chars - len(suf))] + suf
+    return text
+
+
+def format_filter_catalog() -> str:
+    lines = ['FLOWSIGHT SCREEN FILTERS (ffmpeg-style -vf "f1=...,f2,..."):']
+    for name in sorted(FILTERS):
+        sp = FILTERS[name]
+        lines.append(f'  {sp.name:<12s} | {sp.syntax:<46s} | {sp.summary}')
+    return '\n'.join(lines)
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description='FlowSight Screen: ffmpeg-style filter pipeline for screenshots')
+    p.add_argument('-i', '--input', help='Screenshot image path (PNG/JPG/WEBP)')
+    p.add_argument('-vf', default='theme,layout,controls,text_bands,ui_map=48:20',
+                   help='Comma-separated filter chain (default: theme,layout,controls,text_bands,ui_map=48:20)')
+    p.add_argument('--json', action='store_true', help='Emit structured JSON instead of compact text')
+    p.add_argument('--max-chars', type=int, default=6500)
+    p.add_argument('--filters', action='store_true', help='List available filters and exit')
+    args = p.parse_args(argv)
+
+    if args.filters:
+        print(format_filter_catalog())
+        return 0
+    if not args.input:
+        p.error('missing -i/--input (or use --filters)')
+    try:
+        ctx = run_pipeline(args.input, vf=args.vf)
+        if args.json:
+            payload = {
+                'schema': SCHEMA_SCREEN,
+                'source_name': ctx.source_name,
+                'source_sha256': ctx.source_sha256,
+                'full_size': [ctx.full_w, ctx.full_h],
+                'scope': ctx.global_bbox,
+                'trace': ctx.trace,
+                'artifacts': ctx.artifacts,
+            }
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(format_pipeline_report(ctx, max_chars=args.max_chars))
+        return 0
+    except (FilterDeny, fb.BlocksDeny, OSError) as e:
+        print(f'DENY {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

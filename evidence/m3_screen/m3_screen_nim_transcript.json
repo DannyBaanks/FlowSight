@@ -1,0 +1,104 @@
+{
+  "model": "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+  "rc": 0,
+  "elapsed_ms": 17022.5,
+  "prompt_chars": 6646,
+  "response_chars": 2080,
+  "response": "# Análisis de captura FlowSight Screen 1920x1080\n\n## S1. Polaridad/tema y paneles principales\n**DEMONSTRATED** — El tema es **dark** (polarity=dark) con mediana L=20.3. Los 4 paneles principales con sus bboxes:\n\n- **P0** main-pane: bbox=[282, 58, 1920, 1042] (1638×984, 77.7%), bg=#12141c very-dark L=20.3\n- **P1** left-sidebar-band: bbox=[0, 58, 282, 1042] (282×984, 13.4%), bg=#181b25 dark-blue L=27.2\n- **P2** top-bar-band: bbox=[0, 0, 1920, 58] (1920×58, 5.4%), bg=#1c202c dark-blue L=32.2\n- **P3** bottom-bar-band: bbox=[0, 1042, 1920, 1080] (1920×38, 3.5%), bg=#1e2434 dark-blue L=36.0\n\n*H_div_y=[58, 1042], V_div_x=[282]*\n\n---\n\n## S2. Coordenadas click de los 3 botones de acento\n**DEMONSTRATED** — Las coordenadas click=(cx,cy) exactas de cada botón:\n\n- **W0** (azul, barra superior/P2): click=(1815, 28), bbox=[1740, 10, 1890, 46], color=#2563eb\n- **W1** (verde, panel principal/P0): click=(1430, 886), bbox=[1340, 860, 1520, 912], color=#16a34a\n- **W2** (rojo, panel principal/P0): click=(1640, 886), bbox=[1550, 860, 1730, 912], color=#dc2626\n\n---\n\n## S3. Dos cambios principales en el DIFF (after vs before)\n**DEMONSTRATED** — Dos cambios de color en controles del panel P0:\n\n- **D0**: bbox=[695, 415, 1226, 626], px=104721 — transición #16a34a(green) → #2e1a22(dark-magenta), afecta control **W1** (cambio de verde a magenta oscuro)\n- **D1**: bbox=[1335, 855, 1525, 917], px=9360 — transición #16a34a(green) → #ea9418(orange), afecta control **W2** (cambio de verde a naranja)\n\nNingún otro control cambió; los otros 2 botones (W0 azul, W2 rojo manteniendo su color) permanecieron inalterados.\n\n---\n\n## S4. Palabra exacta dentro del botón verde\n**NOT_DEMONSTRATED** — El estado del pipeline OCR es **ABSENT** (\"tesseract binary not installed on PATH\"). Aunque el descriptor del control W1 indica \"[has_inner_text/icon]\", no hay lectura OCR disponible para extraer el texto exacto. Las 22 bandas de texto (T0–T21) solo proporcionan datos geométricos, sin contenido de caracteres leído.\n\n*Para leer el texto interno del botón verde se requeriría instalar tesseract-ocr.*",
+  "synthetic_before_trace": [
+    {
+      "filter": "theme",
+      "params": {},
+      "ms": 11.46
+    },
+    {
+      "filter": "layout",
+      "params": {},
+      "ms": 33.52
+    },
+    {
+      "filter": "controls",
+      "params": {},
+      "ms": 11.9
+    },
+    {
+      "filter": "text_bands",
+      "params": {},
+      "ms": 6.69
+    },
+    {
+      "filter": "ocr",
+      "params": {},
+      "ms": 0.24
+    },
+    {
+      "filter": "ui_map",
+      "params": {
+        "_0": "48",
+        "_1": "20"
+      },
+      "ms": 3.76
+    }
+  ],
+  "synthetic_diff_trace": [
+    {
+      "filter": "layout",
+      "params": {},
+      "ms": 29.97
+    },
+    {
+      "filter": "controls",
+      "params": {},
+      "ms": 12.21
+    },
+    {
+      "filter": "ui_diff",
+      "params": {
+        "_0": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m3_screen/ui_1080p_before.png"
+      },
+      "ms": 113.66
+    }
+  ],
+  "real_screenshot_benchmark": {
+    "size": [
+      1920,
+      1080
+    ],
+    "trace": [
+      {
+        "filter": "theme",
+        "params": {},
+        "ms": 2.93
+      },
+      {
+        "filter": "layout",
+        "params": {},
+        "ms": 19.13
+      },
+      {
+        "filter": "controls",
+        "params": {},
+        "ms": 13.63
+      },
+      {
+        "filter": "text_bands",
+        "params": {},
+        "ms": 10.09
+      },
+      {
+        "filter": "ui_map",
+        "params": {
+          "_0": "48",
+          "_1": "18"
+        },
+        "ms": 3.19
+      }
+    ],
+    "total_ms": 48.97,
+    "report_chars": 6500,
+    "polarity": "dark",
+    "panels": 12,
+    "controls": 18,
+    "text_bands": 67
+  }
+}

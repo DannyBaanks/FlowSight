@@ -23,17 +23,19 @@ from mcp.server.mcpserver import MCPServer
 
 import flowsight as fs
 import flowsight_blocks as fb
+import flowsight_screen as fscr
 
 mcp = MCPServer(
     'flowsight',
     instructions=(
-        'FlowSight gives text-only agents structured, bounded spatial perception over images '
-        'and FLOW programs without giant per-pixel JSON. '
-        'For photos/screenshots (e.g. 1920x1080): call flowsight_map_blocks -> inspect blocks '
-        'with flowsight_get_block (or subdivide_block to zoom) -> call flowsight_stitch_blocks '
-        'with optional block_notes to merge cross-seam regions and synthesize a global view. '
-        'Always distinguish DEMONSTRATED measurements (colors, edges, seam continuity, coords) '
-        'from INFERRED semantic hypotheses.'
+        'FlowSight gives text-only agents structured, bounded spatial perception over screenshots, '
+        'images, and FLOW programs without giant per-pixel JSON. '
+        'For desktop/mobile/web screenshots (ffmpeg-style composable filters): call '
+        'flowsight_screen_filters() to discover filters, then flowsight_screen_run(image_path, vf=...) '
+        'e.g. vf="theme,layout,controls,text_bands,ui_map=48:20" or crop=x:y:w:h to zoom into a panel. '
+        'For high-res split/stitch analysis: flowsight_map_blocks -> flowsight_get_block -> flowsight_stitch_blocks. '
+        'For FLOW programs: flowsight_inspect_lossless(mode="flow"). '
+        'Always distinguish DEMONSTRATED measurements from INFERRED semantic hypotheses.'
     ),
 )
 
@@ -187,6 +189,37 @@ def flowsight_inspect_lossless(
                 return fs.edges(db, meta, max_lines=limit, box=box)
             return f'DENY unknown query: {query}'
     except fs.Deny as e:
+        return f'DENY {e}'
+
+
+@mcp.tool(
+    description=(
+        'List all available ffmpeg-style screenshot filters and their `-vf` syntax '
+        '(crop, theme, layout, controls, text_bands, ocr, ui_map, ui_diff, blocks).'
+    ),
+)
+def flowsight_screen_filters() -> str:
+    return fscr.format_filter_catalog()
+
+
+@mcp.tool(
+    description=(
+        'Run an ffmpeg-style composable filter pipeline (`-vf`) specialized for desktop/web/app '
+        'screenshots (e.g. 1920x1080). Example vf: "theme,layout,controls,text_bands,ui_map=48:20" '
+        'or "crop=0:0:400:1080,controls,text_bands" or "layout,controls,ui_diff=/path/before.png". '
+        'Returns panels, clickable control centers (cx, cy), geometric text bands, wireframe map, '
+        'and exact global coordinates.'
+    ),
+)
+def flowsight_screen_run(
+    image_path: str,
+    vf: str = 'theme,layout,controls,text_bands,ui_map=48:20',
+    max_chars: int = 6500,
+) -> str:
+    try:
+        ctx = fscr.run_pipeline(image_path, vf=vf)
+        return fscr.format_pipeline_report(ctx, max_chars=max(500, max_chars))
+    except (fscr.FilterDeny, fb.BlocksDeny) as e:
         return f'DENY {e}'
 
 

@@ -1,0 +1,59 @@
+FLOWSIGHT SCREEN v1 | ui_1080p_before.png (1920x1080) | scope=[0, 0, 1920, 1080] | SHA256=50c6c1427b966598
+PIPELINE (67.57ms): theme(11.46ms) -> layout(33.52ms) -> controls(11.9ms) -> text_bands(6.69ms) -> ocr(0.24ms) -> ui_map(3.76ms)
+Coordinates: origin top-left (0,0); x right, y down; bboxes [x0,y0,x1,y1) EXCLUSIVE; click=(cx,cy).
+THEME: polarity=dark median_luma=20.3 (dark=96.9% light=1.9%)
+  surfaces: #181818(very-dark):76.1%, #181828(dark-blue):12.9%, #182828(dark-cyan):3.7%, #182838(dark-blue):3.3%
+  accents:  #18a848(green):0.4%, #d82828(red):0.4%, #2868e8(blue):0.2%
+LAYOUT (DEMONSTRATED dividers & panes): H_div_y=[58, 1042] V_div_x=[282] | panels=4/4:
+  P0  main-pane          bbox=[282, 58, 1920, 1042] (1638x984, 77.7%) bg=#12141c(very-dark) L=20.3
+  P1  left-sidebar-band  bbox=[0, 58, 282, 1042] (282x984, 13.4%) bg=#181b25(dark-blue) L=27.2
+  P2  top-bar-band       bbox=[0, 0, 1920, 58] (1920x58, 5.4%) bg=#1c202c(dark-blue) L=32.2
+  P3  bottom-bar-band    bbox=[0, 1042, 1920, 1080] (1920x38, 3.5%) bg=#1e2434(dark-blue) L=36.0
+CONTROLS (DEMONSTRATED clickable candidates, total=3):
+  W0  accent-control   bbox=[1740, 10, 1890, 46] click=(1815, 28) color=#2563eb(blue) panel=P2 [has_inner_text/icon]
+  W1  accent-control   bbox=[1340, 860, 1520, 912] click=(1430, 886) color=#16a34a(green) panel=P0 [has_inner_text/icon]
+  W2  accent-control   bbox=[1550, 860, 1730, 912] click=(1640, 886) color=#dc2626(red) panel=P0 [has_inner_text/icon]
+TEXT BANDS (GEOMETRIC ONLY, no OCR; showing 22/22):
+  T0  bbox=[1756, 19, 1860, 36] (104x17) trans=18.0 contrast=154 control=W0
+  T1  bbox=[15, 90, 172, 108] (157x18) trans=28.0 contrast=176 panel=P1
+  T2  bbox=[321, 98, 646, 117] (325x19) trans=60.0 contrast=197 panel=P0
+  T3  bbox=[15, 132, 198, 150] (183x18) trans=32.0 contrast=176 panel=P1
+  T4  bbox=[321, 134, 716, 153] (395x19) trans=72.0 contrast=197 panel=P0
+  T5  bbox=[15, 174, 225, 192] (210x18) trans=38.0 contrast=176 panel=P1
+  T6  bbox=[321, 170, 787, 189] (466x19) trans=86.0 contrast=197 panel=P0
+  T7  bbox=[321, 206, 858, 225] (537x19) trans=100.0 contrast=197 panel=P0
+  T8  bbox=[15, 216, 251, 234] (236x18) trans=42.0 contrast=176 panel=P1
+  T9  bbox=[321, 242, 928, 261] (607x19) trans=112.0 contrast=197 panel=P0
+  T10 bbox=[15, 258, 172, 276] (157x18) trans=28.0 contrast=176 panel=P1
+  T11 bbox=[321, 278, 646, 297] (325x19) trans=60.0 contrast=197 panel=P0
+  T12 bbox=[15, 300, 198, 318] (183x18) trans=32.0 contrast=176 panel=P1
+  T13 bbox=[321, 314, 716, 333] (395x19) trans=72.0 contrast=197 panel=P0
+  T14 bbox=[15, 342, 225, 360] (210x18) trans=38.0 contrast=176 panel=P1
+  T15 bbox=[321, 350, 787, 369] (466x19) trans=86.0 contrast=197 panel=P0
+  T16 bbox=[15, 384, 251, 402] (236x18) trans=42.0 contrast=176 panel=P1
+  T17 bbox=[321, 386, 858, 405] (537x19) trans=100.0 contrast=197 panel=P0
+  T18 bbox=[321, 422, 928, 441] (607x19) trans=112.0 contrast=197 panel=P0
+  T19 bbox=[1369, 876, 1473, 895] (104x19) trans=18.0 contrast=140 control=W1
+  [TRUNCATED 2 additional text bands; use crop=x:y:w:h to inspect]
+OCR: status=ABSENT (tesseract binary not installed on PATH; install tesseract-ocr to enable text reading (no hallucinated OCR))
+UI WIREFRAME MAP 48x20 (bg: .=dark space=light | dividers: - | + | text_band: = | control: [#] accent / [+] box):
+  .......|...................................[###]
+  -------+----------------------------------------
+  =====..|==========..............................
+  ======.|==============..........................
+  =======|================........................
+  =====..|==========..............................
+  ======.|============............................
+  =======|================........................
+  .......|================........................
+  .......|........................................
+  .......|........................................
+  .......|........................................
+  .......|........................................
+  .......|........................................
+  .......|........................................
+  .......|.........................[###][####]....
+  .......|.........................[###][####]....
+  .......|........................................
+  .......|........................................
+  -------+----------------------------------------

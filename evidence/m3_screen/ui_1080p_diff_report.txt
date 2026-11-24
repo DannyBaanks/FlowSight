@@ -1,0 +1,16 @@
+FLOWSIGHT SCREEN v1 | ui_1080p_after.png (1920x1080) | scope=[0, 0, 1920, 1080] | SHA256=ff3a86a83df40c04
+PIPELINE (155.84ms): layout(29.97ms) -> controls(12.21ms) -> ui_diff(113.66ms)
+Coordinates: origin top-left (0,0); x right, y down; bboxes [x0,y0,x1,y1) EXCLUSIVE; click=(cx,cy).
+LAYOUT (DEMONSTRATED dividers & panes): H_div_y=[58, 1042] V_div_x=[282] | panels=4/4:
+  P0  main-pane          bbox=[282, 58, 1920, 1042] (1638x984, 77.7%) bg=#12141c(very-dark) L=20.3
+  P1  left-sidebar-band  bbox=[0, 58, 282, 1042] (282x984, 13.4%) bg=#181b25(dark-blue) L=27.2
+  P2  top-bar-band       bbox=[0, 0, 1920, 58] (1920x58, 5.4%) bg=#1c202c(dark-blue) L=32.2
+  P3  bottom-bar-band    bbox=[0, 1042, 1920, 1080] (1920x38, 3.5%) bg=#1e2434(dark-blue) L=36.0
+CONTROLS (DEMONSTRATED clickable candidates, total=4):
+  W0  accent-control   bbox=[1740, 10, 1890, 46] click=(1815, 28) color=#2563eb(blue) panel=P2 [has_inner_text/icon]
+  W1  accent-control   bbox=[700, 420, 1221, 621] click=(960, 520) color=#2e1a22(dark-magenta) panel=P0 [flat]
+  W2  accent-control   bbox=[1340, 860, 1520, 912] click=(1430, 886) color=#ea9418(orange) panel=P0 [has_inner_text/icon]
+  W3  accent-control   bbox=[1550, 860, 1730, 912] click=(1640, 886) color=#dc2626(red) panel=P0 [has_inner_text/icon]
+UI DIFF vs ui_1080p_before.png: changed=114081px (5.5%) regions=2/2:
+  D0  bbox=[695, 415, 1226, 626] px=104721 #12141c->#2e1a22 panel=P0 controls=['W1']
+  D1  bbox=[1335, 855, 1525, 917] px=9360 #16a34a->#ea9418 panel=P0 controls=['W2']
