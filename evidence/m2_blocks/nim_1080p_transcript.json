@@ -1,0 +1,66 @@
+{
+  "experiment": "M2-A_1920x1080_NIM_Blind",
+  "model": "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+  "session_id": "00437739bc2a479b",
+  "map_ms": 279.4,
+  "stitch_ms": 9.9,
+  "quantization_error": {
+    "sample_size": [
+      480,
+      270
+    ],
+    "mae_rgb": 5.9,
+    "rmse_rgb": 11.89,
+    "psnr_db": 26.63,
+    "within_delta24_pct": 96.7
+  },
+  "map_L0_chars": 1423,
+  "stitch_report_chars": 6800,
+  "block_runs": {
+    "TL": {
+      "model": "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+      "rc": 0,
+      "elapsed_ms": 14133.8,
+      "prompt_chars": 2767,
+      "response_chars": 762,
+      "response": "Colores dominantes: azul (C1 24.8%, C3 22.8%, C2 19.6%) concentra en bandas superiores e izquierdas; cian (C4 17.7%) ocupa región inferior izquierda; rojo (C5 7.8%) y amarillo pálido (C7 7.2%) aparecen en áreas derechas y centro respectivamente.\n\nRegiones notables: R1 (bandera azul completa ancho, 0-125px vertical) toca borde superior; R0 (bandera azul media, 260-424px) se extiende horizontalmente completa; R2 (cian) projeta izquierda-bajo desde y=415; R3 (azul claro) banda derecha 125-260px; R4 (rojo) esquina inferior derecha 760-960px; R5 (pálido) bloque central 210-430px, 116-328px.\n\nCosturas de unión: R1 toca LEFT+RIGHT+TOP; R0 toca LEFT+RIGHT; R2 toca BOTTOM+LEFT; R3 toca RIGHT; R4 toca BOTTOM+RIGHT; R5 no toca ninguna costura (interior completo).",
+      "stderr_tail": "\u001b[0m\n> build · nvidia/nemotron-3.5-lightning-30b-a3b"
+    },
+    "TR": {
+      "model": "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+      "rc": 0,
+      "elapsed_ms": 15434.5,
+      "prompt_chars": 2657,
+      "response_chars": 836,
+      "response": "1) Los colores dominantes son azulados (C1 #69aaea 27.0%, C2 #4f90e2 25.0%, C3 #3778da 23.2%) dispuestos verticalmente: azul oscuro C3 en la tercera superior (y=0-125), azul medio C2 en la tercera media (y=125-260), y azul claro C1 que transita a cian C4 en la porción inferior.\n\n2) Hay cinco regiones horizontales que abarcan todo el ancho (x=960-1920) excepto R3/R4 sesgadas: R2 toca el borde TOP, R0/R1 tocan LEFT/RIGHT, R3 toca BOTTOM+RIGHT y R4 toca BOTTOM+LEFT; el mapa EDGE muestra bordes Sobel verticales (+++++/....++) concentrados en filas 8-13, delimitando los cambios de color entre regiones.\n\n3) Para unir el bloque después: borde LEFT lo tocan regiones R0, R1, R2, R4; borde RIGHT lo tocan R0, R1, R2, R3; borde TOP solo R2; borde BOTTOM lo tocan R3 y R4 — estos puntos de contacto definen las condiciones de reensamblaje.",
+      "stderr_tail": "\u001b[0m\n> build · nvidia/nemotron-3.5-lightning-30b-a3b"
+    },
+    "BL": {
+      "model": "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+      "rc": 0,
+      "elapsed_ms": 14121.7,
+      "prompt_chars": 2628,
+      "response_chars": 945,
+      "response": "1) El color dominante es C0 verde (68.2%) que ocupa toda la banda inferior del bloque (bbox=[0,704,960,1080]), mientras que C6 cian (14.1%), C5 rojo (7.8%), C8 cian (7.1%) y C4 cian (2.8%) se distribuyen en regiones superiores e intermedias, con el verde concentrado horizontalmente a lo ancho completo y los ciano/rojo fragmentados verticalmente.\n\n2) Las formas notables incluyen R0 que cubre todo el ancho inferior sin bordes (edges=0.0%), R1 y R2 en los cuartos superiores izquierdo/derecho con 3.6% y 1.3% de bordes respectivamente, y R3/R4 a la izquierda con 1.3% de bordes; el mapa EDGE muestra gradientes mayormente planos con solo algunos bordes medios (#) en la fila 4.\n\n3) Para unir el bloque, R0 toca BOTTOM+LEFT+RIGHT, R1 toca LEFT+TOP, R2 toca RIGHT+TOP, R3 toca solo LEFT y R4 toca LEFT+TOP, lo que significa que la costura LEFT es contactada por cinco regiones, TOP por tres (R1,R2,R4), RIGHT por dos (R0,R2) y BOTTOM solo por R0.",
+      "stderr_tail": "\u001b[0m\n> build · nvidia/nemotron-3.5-lightning-30b-a3b"
+    },
+    "BR": {
+      "model": "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+      "rc": 0,
+      "elapsed_ms": 23999.6,
+      "prompt_chars": 2787,
+      "response_chars": 807,
+      "response": "1) Green (C0) dominates at 61.6% filling the lower third of the block (y≥704, full width x960-1920), while cyan (C6,C8,C4) and red (C5) occupy upper regions distributed across top and right edges.\n\n2) The EDGE MAP reveals strong vertical transitions at rows 8-9 between the green lower area and upper cyan/red regions, with notable sharp edges along the x=1160 midline dividing top-left red from top-right cyan, and the right side hosting multiple cyan/red strips.\n\n3) For rejoining: LEFT edge (x=960) is touched by green lower (BR.R0) and top-left red (BR.R2); RIGHT edge (x=1920) is touched by green lower (BR.R0), top-right cyan BR.R1, right-middle cyan BR.R3, and thin top-right pale-yellow BR.R5; TOP edge (y=540) is touched by cyan BR.R1, red BR.R2, and cyan BR.R5; only BR.R0 touches the BOTTOM edge.",
+      "stderr_tail": "\u001b[0m\n> build · nvidia/nemotron-3.5-lightning-30b-a3b"
+    }
+  },
+  "synthesis_run": {
+    "model": "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+    "rc": 0,
+    "elapsed_ms": 26055.8,
+    "prompt_chars": 8291,
+    "response_chars": 1604,
+    "response": "Q1. Dimensiones globales: 1920×1080. Bandas horizontales principales de izqda a dcha (DEMONSTRATED, medido en píxeles de borde):\n- G2: C3 azul (#3778da), y=0–125px, ancho completo.\n- G3: C2 azul (#4f90e2), y=125–260px, desde x=390 a 1920.\n- G1: C1 azul (#69aaea), y=260–424px, ancho completo.\n- G0: C0 verde (#3a773f), y=704–1080px, ancho completo (32.5% de área).\n- Costura horizontal y=540: C4 cian x=0–780 y x=1140–1920; C5 rojo x=780–960 y x=960–1140; todos continuity=100.0%.\n\nQ2. Sí. G6 cruza los 4 cuadrantes: G6 [CROSS-SEAM] spans=['TL','TR','BL','BR'], C5(5,red,#c3262e), bbox=[760,338,1160,742], area~7.8%, edges=6.5%. DEMONSTRATED por continuidad y bbox medidos.\n\nQ3. Región amarillo pálido (C7) en cuadrante TL: G7 [SINGLE-BLK] spans=['TL'], C7(7,pale-yellow,#f5de8d), bbox=[210,116,430,328] dentro de TL=[0,0,960,540]. DEMONSTRATED en global regions.\n\nQ4. Edge map fila 12 lado derecho muestra ####### (strong) en cuadrante BR, pero el texto describe transiciones verticales strong en filas 8–9 de BR (no horizontales). No hay región en mitad inferior con bordes horizontales strong demonstrados; los ####### en edge map tienen orientación no especificada y los bordes descritos son verticales.\n\nQ5. Las 4 costuras midieron continuity=100.0% cada una:\n- TL<->TR vertical x=960: 100.0%\n- BL<->BR vertical x=960: 100.0%\n- TL<->BL horizontal y=540: 100.0%\n- TR<->BR horizontal y=540: 100.0%\nTodos DEMONSTRATED de píxeles de borde reales.\n\nQ6. No. No hay datos en el informe sobre ubicación geográfica ni tipo de cámara; la procedencia en París y uso de DSLR es NOT_DEMONSTRATED por esta salida.",
+    "stderr_tail": "\u001b[0m\n> build · nvidia/nemotron-3.5-lightning-30b-a3b"
+  }
+}

@@ -1,0 +1,83 @@
+FLOWSIGHT STITCH v1 | session=00437739bc2a479b | scene_1080p.png (1920x1080) | scope=[0, 0, 1920, 1080] split=quarters
+APPROXIMATE QUANTIZED: MAE_RGB=5.9 PSNR=26.63dB (seam continuity below is measured directly on full-res border pixels)
+=== 1. SEAM CONTINUITY (DEMONSTRATED from real border pixels) ===
+  TL<->TR at x=960 (V): continuity=100.0%
+    y=[0, 135] continuous C3(blue,#3778da) mean_dRGB=0.0
+    y=[135, 270] continuous C2(blue,#4f90e2) mean_dRGB=0.0
+    y=[270, 337] continuous C1(blue,#69aaea) mean_dRGB=0.0
+    y=[337, 540] continuous C5(red,#c3262e) mean_dRGB=0.0
+  BL<->BR at x=960 (V): continuity=100.0%
+    y=[540, 742] continuous C5(red,#c3262e) mean_dRGB=0.0
+    y=[742, 1080] continuous C0(green,#3a773f) mean_dRGB=0.0
+  TL<->BL at y=540 (H): continuity=100.0%
+    x=[0, 780] continuous C4(cyan,#6e99ac) mean_dRGB=1.0
+    x=[780, 960] continuous C5(red,#c3262e) mean_dRGB=0.0
+  TR<->BR at y=540 (H): continuity=100.0%
+    x=[960, 1140] continuous C5(red,#c3262e) mean_dRGB=0.0
+    x=[1140, 1920] continuous C4(cyan,#6e99ac) mean_dRGB=1.0
+=== 2. UNIFIED GLOBAL REGIONS (DEMONSTRATED cross-seam merge) ===
+  G0 [CROSS-SEAM] spans=['BL', 'BR'] C0(0,green,#3a773f) bbox=[0, 704, 1920, 1080] area~32.5% edges=1.7%
+  G1 [CROSS-SEAM] spans=['TL', 'TR'] C1(1,blue,#69aaea) bbox=[0, 260, 1920, 424] area~12.9% edges=2.5%
+  G2 [CROSS-SEAM] spans=['TL', 'TR'] C3(3,blue,#3778da) bbox=[0, 0, 1920, 125] area~11.5% edges=0.5%
+  G3 [CROSS-SEAM] spans=['TL', 'TR'] C2(2,blue,#4f90e2) bbox=[390, 125, 1920, 260] area~9.7% edges=0.7%
+  G4 [CROSS-SEAM] spans=['TL', 'BL'] C4(4,cyan,#6e99ac) bbox=[0, 415, 760, 656] area~8.4% edges=0.8%
+  G5 [CROSS-SEAM] spans=['TR', 'BR'] C4(4,cyan,#6e99ac) bbox=[1160, 415, 1920, 656] area~8.4% edges=0.8%
+  G6 [CROSS-SEAM] spans=['TL', 'TR', 'BL', 'BR'] C5(5,red,#c3262e) bbox=[760, 338, 1160, 742] area~7.8% edges=6.5%
+  G7 [SINGLE-BLK] spans=['TL'] C7(7,pale-yellow,#f5de8d) bbox=[210, 116, 430, 328] area~1.8% edges=17.0%
+  G8 [SINGLE-BLK] spans=['BL'] C8(8,cyan,#517c77) bbox=[0, 636, 760, 704] area~1.8% edges=1.3%
+  G9 [SINGLE-BLK] spans=['BR'] C8(8,cyan,#517c77) bbox=[1160, 636, 1920, 704] area~1.8% edges=1.3%
+  G10 [SINGLE-BLK] spans=['BR'] C7(7,pale-yellow,#f5de8d) bbox=[1280, 820, 1780, 878] area~1.4% edges=36.7%
+=== 3. STITCHED OVERVIEW MAPS (seam lines marked with | / -) ===
+Color map (global palette symbols):
+  333333333333|333333333333
+  333333333333|333333333333
+  22277?222222|222222222222
+  222777222222|222222222222
+  1111?1111111|111111111111
+  111111111155|555111111111
+  444444444455|555444444444
+  ------------+------------
+  ?????????655|555?????????
+  666666666655|555666666666
+  000000000055|555000000000
+  000000000000|000000000000
+  000000000000|0000777777?0
+  000000000000|000000000000
+  000000000000|000000000000
+Edge map (.=flat :=soft +=medium #=strong):
+  ............|............
+  ....+.......|............
+  .....+......|............
+  .....+......|............
+  ...:+.....++|+++.........
+  .........+..|..+.........
+  .........:..|..:.........
+  ------------+------------
+  .........:..|..:.........
+  .........:..|..:.........
+  ............|............
+  ............|............
+  ............|....#######.
+  ............|............
+  ............|............
+=== 4. ALIGNED BLOCK OBSERVATIONS (AGENT_NOTES / INFERRED, NOT raw pixel proof) ===
+  [TL [0, 0, 960, 540]]: Colores dominantes: azul (C1 24.8%, C3 22.8%, C2 19.6%) concentra en bandas superiores e izquierdas; cian (C4 17.7%) ocupa región inferior izquierda; rojo (C5 7.8%) y amarillo pálido (C7 7.2%) aparecen en áreas derechas y centro respectivamente.
+
+Regiones notables: R1 (bandera azul completa ancho, 0-125px vertical) toca borde superior; R0 (bandera azul media, 260-424px) se extiende horizontalmente completa; R2 (cian) projeta izquierda-bajo desde y=415; R3 (azul claro) banda derecha 125-260px; R4 (rojo) esquina inferior derecha 760-960px; R5 (pálido) bloque central 210-430px, 116-328px.
+
+Costuras de unión: R1 toca LEFT+RIGHT+TOP; R0 toca LEFT+RIGHT; R2 toca BOTTOM+LEFT; R3 toca RIGHT; R4 toca BOTTOM+RIGHT; R5 no toca ninguna costura (interior completo).
+  [TR [960, 0, 1920, 540]]: 1) Los colores dominantes son azulados (C1 #69aaea 27.0%, C2 #4f90e2 25.0%, C3 #3778da 23.2%) dispuestos verticalmente: azul oscuro C3 en la tercera superior (y=0-125), azul medio C2 en la tercera media (y=125-260), y azul claro C1 que transita a cian C4 en la porción inferior.
+
+2) Hay cinco regiones horizontales que abarcan todo el ancho (x=960-1920) excepto R3/R4 sesgadas: R2 toca el borde TOP, R0/R1 tocan LEFT/RIGHT, R3 toca BOTTOM+RIGHT y R4 toca BOTTOM+LEFT; el mapa EDGE muestra bordes Sobel verticales (+++++/....++) concentrados en filas 8-13, delimitando los cambios de color entre regiones.
+
+3) Para unir el bloque después: borde LEFT lo tocan regiones R0, R1, R2, R4; borde RIGHT lo tocan R0, R1, R2, R3; borde TOP solo R2; borde BOTTOM lo tocan R3 y R4 — estos puntos de contacto definen las condiciones de reensamblaje.
+  [BL [0, 540, 960, 1080]]: 1) El color dominante es C0 verde (68.2%) que ocupa toda la banda inferior del bloque (bbox=[0,704,960,1080]), mientras que C6 cian (14.1%), C5 rojo (7.8%), C8 cian (7.1%) y C4 cian (2.8%) se distribuyen en regiones superiores e intermedias, con el verde concentrado horizontalmente a lo ancho completo y los ciano/rojo fragmentados verticalmente.
+
+2) Las formas notables incluyen R0 que cubre todo el ancho inferior sin bordes (edges=0.0%), R1 y R2 en los cuartos superiores izquierdo/derecho con 3.6% y 1.3% de bordes respectivamente, y R3/R4 a la izquierda con 1.3% de bordes; el mapa EDGE muestra gradientes mayormente planos con solo algunos bordes medios (#) en la fila 4.
+
+3) Para unir el bloque, R0 toca BOTTOM+LEFT+RIGHT, R1 toca LEFT+TOP, R2 toca RIGHT+TOP, R3 toca solo LEFT y R4 toca LEFT+TOP, lo que significa que la costura LEFT es contactada por cinco regiones, TOP por tres (R1,R2,R4), RIGHT por dos (R0,R2) y BOTTOM solo por R0.
+  [BR [960, 540, 1920, 1080]]: 1) Green (C0) dominates at 61.6% filling the lower third of the block (y≥704, full width x960-1920), while cyan (C6,C8,C4) and red (C5) occupy upper regions distributed across top and right edges.
+
+2) The EDGE MAP reveals strong vertical transitions at rows 8-9 between the green lower area and upper cyan/red regions, with notable sharp edges along the x=1160 midline dividing top-left red from top-right cyan, and the right side hosting multiple cyan/red strips.
+
+3) For rejoining: LEFT edge (x=960) is touched by green lower (BR.R0) and top-left red (BR.R2); RIGHT edge (x=1920) is touched by green lower (BR.R0), top-right cyan BR.R1, right-middle cyan BR.R3, and thin top-right pale-yellow BR.R5; TOP edge (y=540) is touched by cyan BR.R1, red BR.R2, and cyan BR.R5; only BR.R0 touches the BOTTOM edge.

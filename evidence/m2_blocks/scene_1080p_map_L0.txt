@@ -1,0 +1,19 @@
+FLOWSIGHT BLOCKS v1 | session=00437739bc2a479b | image=scene_1080p.png (1920x1080)
+Scope: global bbox=[0, 0, 1920, 1080] (origin top-left (0,0), x right, y down, end EXCLUSIVE) | split=quarters
+APPROXIMATE QUANTIZED (K=9): MAE_RGB=5.9 RMSE_RGB=11.89 PSNR=26.63dB within_d24=96.7% (measured on 480x270)
+Shared Global Palette (HSV family = math tag, NOT semantic object identity):
+  0=C0  #3a773f green          L= 94.4 (32.9%)
+  1=C1  #69aaea blue           L=157.9 (12.4%)
+  2=C2  #4f90e2 blue           L=133.9 (11.6%)
+  3=C3  #3778da blue           L=111.7 (11.4%)
+  4=C4  #6e99ac cyan           L=142.3 (10.3%)
+  5=C5  #c3262e red            L= 85.9 ( 7.7%)
+  6=C6  #5b848c cyan           L=120.7 ( 7.3%)
+  7=C7  #f5de8d pale-yellow    L=219.6 ( 3.3%)
+  8=C8  #517c77 cyan           L=110.6 ( 3.0%)
+Blocks (4):
+  TL  bbox=[0, 0, 960, 540] (960x540) luma=137.7±28.0 edges= 4.4% (isotropic) top=[C1:25%, C3:23%, C2:20%] regions=6
+  TR  bbox=[960, 0, 1920, 540] (960x540) luma=133.1±21.9 edges= 1.5% (isotropic) top=[C1:27%, C2:25%, C3:23%] regions=5
+  BL  bbox=[0, 540, 960, 1080] (960x540) luma=100.1±12.7 edges= 0.6% (flat) top=[C0:68%, C6:14%, C5:8%] regions=5
+  BR  bbox=[960, 540, 1920, 1080] (960x540) luma=108.8±34.8 edges= 5.7% (horizontal) top=[C0:62%, C6:15%, C5:8%] regions=6
+Next tools: flowsight_get_block(session_id, block_id), flowsight_subdivide_block(...), flowsight_stitch_blocks(session_id, block_notes)

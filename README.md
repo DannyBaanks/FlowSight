@@ -7,7 +7,34 @@
 
 ---
 
-## Dos modos lossless explícitos
+## Dos modos lossless explícitos (M1) + Modo bloques alta resolución & MCP (M2)
+
+### 0. Modo bloques alta resolución (`flowsight_blocks.py`) y Servidor MCP (`flowsight_mcp.py`)
+Para fotos y screenshots grandes (`1920×1080` o cualquier PNG/JPG/WEBP hasta `8192px`, >64 colores) donde el modo lossless rechaza por diseño:
+- **Explícitamente aproximado (`photo-blocks-v1`):** paleta global compartida (`median-cut` + refinamiento Lloyd k-means determinista) con métricas reales de error (`MAE_RGB`, `RMSE_RGB`, `PSNR_dB`, `within_d24%`).
+- **Partición en mitades o cuartos** (`quarters`: `TL/TR/BL/BR`; `halves_h`: `L/R`; `halves_v`: `T/B`) + **subdivisión recursiva** (quadtree zoom) con mapa de color y **mapa de bordes Sobel** por bloque.
+- **Unión estructural y semántica (`stitch_blocks`):** mide continuidad píxel a píxel en las costuras reales, fusiona regiones trans-frontera (`G0..Gn [CROSS-SEAM]`), re-ensambla el mapa global y alinea notas textuales por bloque (`AGENT_NOTES / INFERRED`).
+
+```bash
+# CLI directo de bloques 1920x1080
+python3 flowsight_blocks.py map foto_1080p.png --split quarters --colors 12
+python3 flowsight_blocks.py block <session_id> TL
+python3 flowsight_blocks.py subdivide <session_id> TL --split quarters
+python3 flowsight_blocks.py stitch <session_id> --notes-json '{"TL":"...","TR":"..."}'
+
+# Arrancar servidor MCP stdio (mcp 2.x)
+python3 flowsight_mcp.py
+```
+
+Snippet listo para registrar en `~/.codex-web-http/hub/servers.json` (cuando decidas habilitarlo en `isymcp-hub`):
+```json
+"flowsight": {
+  "command": "python3",
+  "args": ["/home/danny/Development/ISyCo Git/FlowSight/flowsight_mcp.py"],
+  "cwd": "/home/danny/Development/ISyCo Git/FlowSight",
+  "isolation": "shared"
+}
+```
 
 ### 1. `--mode flow` — Índice nativo de 3 canales para programas FLOW (`flowsight-flow-v1`)
 Los programas FLOW (`DannyBaanks/FLOW`) codifican **dos capas distintas en la misma imagen RGB**:
@@ -82,7 +109,9 @@ python3 flowsight.py export-flowpaint sprite.sqlite sprite.flowpaint
 - [`evidence/m0/`](evidence/m0/) — Evidencia original M0 intacta (`GATES.md`, `M0_SHA256SUMS.txt`, benchmarks y artefactos).
 - [`evidence/m1_p1/`](evidence/m1_p1/) — Benchmark, índices, L0 y verificación de gates M1 Prioridad 1 sobre `hello_flow.png` y `vortex.png`.
 - [`evidence/m1_blind/`](evidence/m1_blind/) — Transcripts completos y auditoría de los experimentos ciegos M1 (`m1_a_vortex`, `m1_b_hello_flow`, `m1_c_visual_p2`).
-- [`reports/GATES_M1.md`](reports/GATES_M1.md) — Matriz consolidada de resultados clasificados como `DEMONSTRATED`, `INFERRED` o `NOT_DEMONSTRATED`.
+- [`evidence/m2_blocks/`](evidence/m2_blocks/) — Artefactos 1920×1080, salidas de bloques/stitch y transcript real con NVIDIA NIM (`nemotron-3.5-lightning-30b-a3b`).
+- [`reports/GATES_M1.md`](reports/GATES_M1.md) — Matriz consolidada M1 (`DEMONSTRATED`, `INFERRED`, `NOT_DEMONSTRATED`).
+- [`reports/GATES_M2.md`](reports/GATES_M2.md) — Matriz consolidada M2 (bloques 1920×1080, stitching, MCP stdio E2E y experimento NVIDIA NIM).
 
 ## Licencia
 
