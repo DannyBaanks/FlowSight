@@ -1,0 +1,283 @@
+{
+  "cases": {
+    "pr_dark": {
+      "path": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_pr_dark.png",
+      "theme": "dark",
+      "controls": [
+        {
+          "name": "email_input",
+          "bbox": [
+            340,
+            120,
+            680,
+            158
+          ],
+          "expected_text": "Email:",
+          "expected_assoc": "LABEL_ASSOCIATED",
+          "label_bbox": [
+            260,
+            133,
+            316,
+            145
+          ]
+        },
+        {
+          "name": "branch_input",
+          "bbox": [
+            260,
+            222,
+            680,
+            260
+          ],
+          "expected_text": "Target Branch",
+          "expected_assoc": "LABEL_ASSOCIATED",
+          "label_bbox": [
+            260,
+            197,
+            386,
+            212
+          ]
+        },
+        {
+          "name": "merge_btn",
+          "bbox": [
+            260,
+            520,
+            510,
+            568
+          ],
+          "expected_text": "Merge pull request",
+          "expected_assoc": "TEXT_INSIDE",
+          "text_bbox": [
+            288,
+            535,
+            481,
+            553
+          ]
+        },
+        {
+          "name": "save_btn",
+          "bbox": [
+            820,
+            520,
+            960,
+            568
+          ],
+          "expected_text": "Save",
+          "expected_assoc": "TEXT_INSIDE",
+          "text_bbox": [
+            865,
+            537,
+            914,
+            550
+          ]
+        },
+        {
+          "name": "cancel_btn",
+          "bbox": [
+            978,
+            520,
+            1138,
+            568
+          ],
+          "expected_text": "Cancel",
+          "expected_assoc": "TEXT_INSIDE",
+          "text_bbox": [
+            1024,
+            537,
+            1091,
+            551
+          ]
+        }
+      ]
+    },
+    "pr_light": {
+      "path": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_pr_light.png",
+      "theme": "light",
+      "controls": [
+        {
+          "name": "email_input",
+          "bbox": [
+            340,
+            120,
+            680,
+            158
+          ],
+          "expected_text": "Email:",
+          "expected_assoc": "LABEL_ASSOCIATED",
+          "label_bbox": [
+            260,
+            133,
+            316,
+            145
+          ]
+        },
+        {
+          "name": "branch_input",
+          "bbox": [
+            260,
+            222,
+            680,
+            260
+          ],
+          "expected_text": "Target Branch",
+          "expected_assoc": "LABEL_ASSOCIATED",
+          "label_bbox": [
+            260,
+            197,
+            386,
+            212
+          ]
+        },
+        {
+          "name": "merge_btn",
+          "bbox": [
+            260,
+            520,
+            510,
+            568
+          ],
+          "expected_text": "Merge pull request",
+          "expected_assoc": "TEXT_INSIDE",
+          "text_bbox": [
+            288,
+            535,
+            481,
+            553
+          ]
+        },
+        {
+          "name": "save_btn",
+          "bbox": [
+            820,
+            520,
+            960,
+            568
+          ],
+          "expected_text": "Save",
+          "expected_assoc": "TEXT_INSIDE",
+          "text_bbox": [
+            865,
+            537,
+            914,
+            550
+          ]
+        },
+        {
+          "name": "cancel_btn",
+          "bbox": [
+            978,
+            520,
+            1138,
+            568
+          ],
+          "expected_text": "Cancel",
+          "expected_assoc": "TEXT_INSIDE",
+          "text_bbox": [
+            1024,
+            537,
+            1091,
+            551
+          ]
+        }
+      ]
+    },
+    "lowcontrast_nested": {
+      "path": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_lowcontrast_nested.png",
+      "low_contrast_btn": [
+        260,
+        120,
+        440,
+        162
+      ],
+      "low_contrast_text_bbox": [
+        294,
+        135,
+        405,
+        146
+      ],
+      "card_box": [
+        520,
+        200,
+        980,
+        440
+      ],
+      "inner_btn": [
+        780,
+        360,
+        940,
+        408
+      ],
+      "inner_text_bbox": [
+        820,
+        377,
+        900,
+        391
+      ]
+    },
+    "modal_and_color_change": {
+      "frame_a": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_pr_dark.png",
+      "frame_b": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_modal_and_color_change.png",
+      "new_modal_box": [
+        700,
+        100,
+        1160,
+        290
+      ],
+      "new_modal_btn": [
+        960,
+        224,
+        1130,
+        268
+      ],
+      "new_modal_btn_text_bbox": [
+        1006,
+        239,
+        1084,
+        253
+      ],
+      "color_changed_btn": [
+        260,
+        520,
+        510,
+        568
+      ]
+    },
+    "move_button": {
+      "frame_a": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_move_a.png",
+      "frame_b": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_move_b.png",
+      "box_a": [
+        320,
+        320,
+        500,
+        368
+      ],
+      "box_b": [
+        460,
+        270,
+        640,
+        318
+      ]
+    },
+    "disappear_and_new_far": {
+      "frame_a": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_disappear_a.png",
+      "frame_b": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_disappear_b.png",
+      "removed": [
+        260,
+        100,
+        420,
+        146
+      ],
+      "added": [
+        1060,
+        580,
+        1220,
+        626
+      ]
+    },
+    "ambiguous_identical": {
+      "frame_a": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_ambiguous_a.png",
+      "frame_b": "/home/danny/Development/ISyCo Git/FlowSight/evidence/m4/corpus/case_ambiguous_b.png"
+    }
+  }
+}

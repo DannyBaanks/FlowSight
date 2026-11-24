@@ -1,0 +1,35 @@
+FLOWSIGHT SCREEN v1 | case_modal_and_color_change.png (1280x720) | scope=[0, 0, 1280, 720] | SHA256=e9a20da6a8f924c2
+PIPELINE (88.35ms): layout(12.38ms) -> controls(11.84ms) -> ocr(0.36ms) -> ui_diff(63.77ms)
+Coordinates: origin top-left (0,0); x right, y down; bboxes [x0,y0,x1,y1) EXCLUSIVE; click=(cx,cy). Local W-IDs are per-frame only.
+LAYOUT (DEMONSTRATED dividers & panes): H_div_y=[54, 224, 520, 568, 688] V_div_x=[222] | panels=10/10:
+  P0  main-pane          bbox=[222, 224, 1280, 520] (1058x296, 34.0%) bg=#12141c(very-dark) L=20.3
+  P1  sub-pane           bbox=[222, 54, 1280, 224] (1058x170, 19.5%) bg=#12141c(very-dark) L=20.3
+  P2  sub-pane           bbox=[222, 568, 1280, 688] (1058x120, 13.8%) bg=#12141c(very-dark) L=20.3
+  P3  top-bar-band       bbox=[0, 0, 1280, 54] (1280x54, 7.5%) bg=#1c202c(dark-blue) L=32.2
+  P4  sub-pane           bbox=[0, 224, 222, 520] (222x296, 7.1%) bg=#181b25(dark-blue) L=27.2
+  P5  sub-pane           bbox=[222, 520, 1280, 568] (1058x48, 5.5%) bg=#25261c(dark-yellow) L=36.6
+  P6  bottom-bar-band    bbox=[0, 688, 1280, 720] (1280x32, 4.5%) bg=#1c202c(dark-blue) L=32.2
+  P7  sub-pane           bbox=[0, 54, 222, 224] (222x170, 4.1%) bg=#181b25(dark-blue) L=27.2
+  P8  sub-pane           bbox=[0, 568, 222, 688] (222x120, 2.9%) bg=#181b25(dark-blue) L=27.2
+  P9  sub-pane           bbox=[0, 520, 222, 568] (222x48, 1.2%) bg=#181b25(dark-blue) L=27.2
+CONTROLS (DEMONSTRATED geometric candidates — appearance != verified interactivity, total=7):
+  W0  type=accent-control   bbox=[700, 100, 1160, 290] click=(930, 195) color=#341822(dark-magenta) panel=None text=None text_source=OCR_ABSENT association=NO_TEXT_EVIDENCE(OCR_ABSENT)
+  W1  type=input-or-bar-box bbox=[338, 118, 681, 159] click=(509, 138) color=#0e1018(very-dark) panel=P1 text=None text_source=OCR_ABSENT association=NO_TEXT_EVIDENCE(OCR_ABSENT)
+  W2  type=input-or-bar-box bbox=[258, 220, 681, 261] click=(469, 240) color=#0e1018(very-dark) panel=P0 text=None text_source=OCR_ABSENT association=NO_TEXT_EVIDENCE(OCR_ABSENT)
+  W3  type=input-or-bar-box bbox=[958, 222, 1131, 269] click=(1044, 245) color=#d946ef(violet) panel=P0 text=None text_source=OCR_ABSENT association=NO_TEXT_EVIDENCE(OCR_ABSENT)
+  W4  type=accent-control   bbox=[260, 520, 510, 568] click=(385, 544) color=#ea9418(orange) panel=P5 text=None text_source=OCR_ABSENT association=NO_TEXT_EVIDENCE(OCR_ABSENT)
+  W5  type=accent-control   bbox=[820, 520, 960, 568] click=(890, 544) color=#2563eb(blue) panel=P5 text=None text_source=OCR_ABSENT association=NO_TEXT_EVIDENCE(OCR_ABSENT)
+  W6  type=accent-control   bbox=[978, 520, 1138, 568] click=(1058, 544) color=#dc2626(red) panel=P5 text=None text_source=OCR_ABSENT association=NO_TEXT_EVIDENCE(OCR_ABSENT)
+OCR: status=OCR_ABSENT engine=none (tesseract binary not installed on PATH; install tesseract-ocr to enable real OCR)
+UI DIFF (IDENTITY-BASED) frame_a=case_pr_dark.png(1f4bc09d) -> frame_b=case_modal_and_color_change.png(e9a20da6) | changed_px=99400 (10.79%) | tracks={'COLOR_CHANGED': 1, 'NEW_CONTROL': 2, 'UNCHANGED_CONTROL': 4}
+TRACKED CONTROLS (persistent track=K<n> separate from per-frame local W<n>):
+  track=K2  local_a=W2 ->local_b=W4  COLOR_CHANGED bbox=[260, 520, 510, 568] color=#16a34a(green)->#ea9418(orange) INFERRED=['STATE_CHANGED_CANDIDATE']
+  track=K5  local_b=W0  NEW_CONTROL bbox=[700, 100, 1160, 290] color=#341822(dark-magenta) panel=None
+  track=K6  local_b=W3  NEW_CONTROL bbox=[958, 222, 1131, 269] color=#d946ef(violet) panel=P0
+  track=K0  local_a=W0 ->local_b=W1  UNCHANGED_CONTROL bbox=[338, 118, 681, 159]
+  track=K1  local_a=W1 ->local_b=W2  UNCHANGED_CONTROL bbox=[258, 220, 681, 261]
+  track=K3  local_a=W3 ->local_b=W5  UNCHANGED_CONTROL bbox=[820, 520, 960, 568]
+  track=K4  local_a=W4 ->local_b=W6  UNCHANGED_CONTROL bbox=[978, 520, 1138, 568]
+PIXEL DIFF REGIONS (2/2):
+  D0  bbox=[695, 95, 1165, 295] px=87400 #12141c(very-dark)->#341822(dark-magenta) panel=P1 tracks=['K5', 'K6']
+  D1  bbox=[255, 515, 515, 573] px=12000 #16a34a(green)->#ea9418(orange) panel=P5 tracks=['K2']

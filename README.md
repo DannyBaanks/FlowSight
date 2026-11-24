@@ -9,20 +9,22 @@
 
 ## Tres motores integrados: Screenshot Filters estilo `ffmpeg` (M3) + Bloques 1920×1080 (M2) + Lossless FLOW/Visual (M1)
 
-### M3. Motor de filtros componibles estilo `ffmpeg` para Capturas de Pantalla (`flowsight_screen.py`)
-Pipeline determinista `-vf "f1=...,f2,..."` (OpenCV + NumPy + Pillow, ~49–68 ms en `1920×1080` real):
-- Filtros incluidos: `crop`, `theme`, `layout`, `controls` (con `click=(cx,cy)`), `text_bands` (geométrico sin OCR), `ocr` (opcional fail-closed con `tesseract`), `ui_map` (wireframe ASCII compacto), `ui_diff` y `blocks`.
+### M3/M4. Motor de filtros componibles estilo `ffmpeg` para Capturas de Pantalla (`flowsight_screen.py`)
+Pipeline determinista `-vf "f1=...,f2,..."` (OpenCV + NumPy + SciPy + Pillow):
+- **10 filtros con metadata declarativa (`--filters`):** `crop`, `theme`, `layout`, `controls` (con `click=(cx,cy)`), `text_bands` (geométrico sin OCR), `ocr` (Tesseract local + asociación geométrica `TEXT_INSIDE`/`LABEL_ASSOCIATED`/`AMBIGUOUS_ASSOCIATION`/`NO_TEXT_EVIDENCE`, fail-closed `OCR_ABSENT`), `ui_map` (wireframe ASCII compacto), `ui_diff` (**basado en identidad temporal** con asignación global óptima, tracks persistentes `K0..Kn`, 9 clasificaciones y detección de `AMBIGUOUS_MATCH`), `vlm_probe` (contrato M4-C **desactivado por defecto**) y `blocks`.
 
 ```bash
-# Ver catálogo de filtros (estilo `ffmpeg -filters`)
+# Ver catálogo declarativo de filtros (estilo `ffmpeg -filters`)
 python3 flowsight_screen.py --filters
 
-# Analizar captura 1920x1080
-python3 flowsight_screen.py -i screen.png -vf "theme,layout,controls,text_bands,ui_map=48:20"
+# Analizar captura 1920x1080 con OCR + asociación a controles
+python3 flowsight_screen.py -i screen.png -vf "theme,layout,controls,text_bands,ocr,ui_map=48:20"
 
-# Zoom de fóvea preservando coordenadas globales + diff contra captura anterior
-python3 flowsight_screen.py -i after.png -vf "crop=0:0:960:540,layout,controls,ui_diff=before.png"
+# Diff basado en identidad temporal (tracks persistentes K0..Kn)
+python3 flowsight_screen.py -i after.png -vf "layout,controls,ocr,ui_diff=before.png"
 ```
+
+Registro manual y reversible en `isymcp-hub` (sin modificar el daemon automáticamente): ver [`docs/MCP_REGISTRATION.md`](docs/MCP_REGISTRATION.md).
 
 ### 0. Modo bloques alta resolución (`flowsight_blocks.py`) y Servidor MCP (`flowsight_mcp.py`)
 Para fotos y screenshots grandes (`1920×1080` o cualquier PNG/JPG/WEBP hasta `8192px`, >64 colores) donde el modo lossless rechaza por diseño:
@@ -126,9 +128,11 @@ python3 flowsight.py export-flowpaint sprite.sqlite sprite.flowpaint
 - [`evidence/m1_blind/`](evidence/m1_blind/) — Transcripts completos y auditoría de los experimentos ciegos M1 (`m1_a_vortex`, `m1_b_hello_flow`, `m1_c_visual_p2`).
 - [`evidence/m2_blocks/`](evidence/m2_blocks/) — Artefactos 1920×1080, salidas de bloques/stitch y transcript real con NVIDIA NIM (`nemotron-3.5-lightning-30b-a3b`).
 - [`evidence/m3_screen/`](evidence/m3_screen/) — Capturas UI 1920×1080, reportes `-vf`, `ui_diff` y transcript ciego con NVIDIA NIM.
+- [`evidence/m4/`](evidence/m4/) — Corpus adversarial de 13 casos con `ground_truth.json`, `benchmark_m4.json`, ejemplos OCR/`ui_diff` y transcript ciego M4 con NVIDIA NIM.
 - [`reports/GATES_M1.md`](reports/GATES_M1.md) — Matriz consolidada M1 (`DEMONSTRATED`, `INFERRED`, `NOT_DEMONSTRATED`).
 - [`reports/GATES_M2.md`](reports/GATES_M2.md) — Matriz consolidada M2 (bloques 1920×1080, stitching, MCP stdio E2E y experimento NVIDIA NIM).
 - [`reports/GATES_M3.md`](reports/GATES_M3.md) — Matriz consolidada M3 (motor de filtros estilo `ffmpeg` para capturas de pantalla).
+- [`reports/GATES_M4.md`](reports/GATES_M4.md) — Matriz consolidada M4 (OCR + asociación texto-control, `ui_diff` por identidad temporal, contrato `vlm_probe` y experimento ciego Q1..Q6).
 
 ## Licencia
 

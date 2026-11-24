@@ -1,0 +1,71 @@
+{
+  "tesseract_installed": false,
+  "tesseract_engine": "absent",
+  "ocr_cer_wer_real": "NOT_DEMONSTRATED (tesseract binary absent on host PATH)",
+  "synthetic_1280x720_fast": {
+    "layout_ms": 13.3,
+    "controls_ms": 8.42,
+    "text_bands_ms": 3.43,
+    "total_ms": 33.32,
+    "report_chars": 3694,
+    "mean_bbox_iou_vs_gt": 0.9678,
+    "per_control_iou": [
+      0.9187,
+      0.9203,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "synthetic_1280x720_with_ocr_stage": {
+    "ocr_status": "OCR_ABSENT",
+    "ocr_ms": 0.48,
+    "association_ms": 0.04,
+    "total_ms": 30.83,
+    "report_chars": 4118
+  },
+  "geometric_association_benchmark_synthetic_ocr": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "tp": 5,
+    "fp": 0,
+    "gt_total": 5,
+    "elapsed_ms": 1.45
+  },
+  "temporal_matching_metrics": {
+    "ui_diff_ms": 63.77,
+    "diff_report_chars": 4054,
+    "case78_modal_plus_color": {
+      "fp_removed_controls": 0,
+      "color_changed_detected": 1,
+      "new_controls_detected": 2
+    },
+    "case9_move_exact": true,
+    "case10_negative_far_exact": true,
+    "case13_ambiguous_detected": true
+  },
+  "real_desktop_1920x1080": {
+    "size": [
+      1920,
+      1080
+    ],
+    "fast_mode_ms": {
+      "layout": 51.99,
+      "controls": 38.61,
+      "text_bands": 48.23,
+      "total": 146.84,
+      "report_chars": 6500
+    },
+    "ocr_mode_ms": {
+      "ocr_status": "OCR_ABSENT",
+      "ocr": 0.56,
+      "association": 0.09,
+      "total": 117.39
+    }
+  },
+  "memory_bytes": {
+    "current": 29632737,
+    "peak": 62733491,
+    "peak_mib": 59.83
+  }
+}
