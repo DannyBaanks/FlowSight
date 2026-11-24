@@ -1,0 +1,43 @@
+FLOWSIGHT v1 | 64x64 RGB | mode=flow (native 3-channel lossless) | SHA256(RGB)=e27e829d929ca57f
+Coordinates: origin top-left (0,0); x right, y down; boxes [x0,y0,x1,y1) exclusive.
+FLOW raw channels: R,G define vector ((value/127.5)-1); B defines instruction. NOT image gradients.
+Vector field R/G (exact unquantized stored): distinct_RGB=873 (R=249, G=249) | active(|v|>=0.02)=4091/4096 (99.9%) | mean_v=(+0.010,-0.018) mean_mag=0.999 max_mag=1.011 coherence=0.020
+Channel B discrete instructions/data (exact counts):
+  B=0   HALT                 4088/4096 (99.8%)
+  B=255 SPAWN MARKER (NOP)   8/4096 (0.2%)
+Spawns (B=255): 8 total:
+  pid=0 (29,29) v=(+0.702,-0.710) mag=0.998 deg=-45.3 dir=NE
+  pid=1 (32,29) v=(+1.000,-0.004) mag=1.000 deg=-0.2 dir=E
+  pid=2 (34,29) v=(+0.702,+0.702) mag=0.993 deg=+45.0 dir=SE
+  pid=3 (29,32) v=(-0.004,-1.000) mag=1.000 deg=-90.2 dir=N
+  pid=4 (35,32) v=(-0.004,+1.000) mag=1.000 deg=+90.2 dir=S
+  pid=5 (29,34) v=(-0.710,-0.710) mag=1.004 deg=-135.0 dir=NW
+  pid=6 (34,34) v=(-0.710,+0.702) mag=0.998 deg=+135.3 dir=SW
+  pid=7 (32,35) v=(-1.000,-0.004) mag=1.000 deg=-179.8 dir=W
+Vector field summary map 24x16 (APPROXIMATE tile mean; arrows=dir if mean_mag>=0.05, *=low-coherence<0.35, .=zero):
+  ↗↗↗↗↗↗↗↗→→→→→→→→→↘↘↘↘↘↘↘
+  ↗↗↗↗↗↗↗↗→→→→→→→→→↘↘↘↘↘↘↘
+  ↗↗↗↗↗↗↗↗↗→→→→→→→↘↘↘↘↘↘↘↘
+  ↗↗↗↗↗↗↗↗↗→→→→→→↘↘↘↘↘↘↘↘↘
+  ↗↗↗↗↗↗↗↗↗↗→→→→→↘↘↘↘↘↘↘↘↘
+  ↑↑↑↗↗↗↗↗↗↗↗→→→↘↘↘↘↘↘↘↘↓↓
+  ↑↑↑↑↑↑↑↗↗↗↗→→↘↘↘↘↘↓↓↓↓↓↓
+  ↑↑↑↑↑↑↑↑↑↑↗↗→↘↓↓↓↓↓↓↓↓↓↓
+  ↑↑↑↑↑↑↑↑↑↑↑↖←↙↓↓↓↓↓↓↓↓↓↓
+  ↑↑↑↑↑↑↑↖↖↖↖←←↙↙↙↙↓↓↓↓↓↓↓
+  ↑↑↑↑↖↖↖↖↖↖↖←←←↙↙↙↙↙↙↙↓↓↓
+  ↖↖↖↖↖↖↖↖↖↖←←←←↙↙↙↙↙↙↙↙↙↙
+  ↖↖↖↖↖↖↖↖↖↖←←←←←↙↙↙↙↙↙↙↙↙
+  ↖↖↖↖↖↖↖↖↖←←←←←←←↙↙↙↙↙↙↙↙
+  ↖↖↖↖↖↖↖↖←←←←←←←←↙↙↙↙↙↙↙↙
+  ↖↖↖↖↖↖↖↖←←←←←←←←←↙↙↙↙↙↙↙
+Channel B components (4-connected): total=9 (saved=9); non-HALT shown (7/8):
+  id=1 B=255(SPAWN) bbox=[29,29,30,30) area=1
+  id=2 B=255(SPAWN) bbox=[32,29,33,30) area=1
+  id=3 B=255(SPAWN) bbox=[34,29,35,30) area=1
+  id=4 B=255(SPAWN) bbox=[29,32,30,33) area=1
+  id=5 B=255(SPAWN) bbox=[35,32,36,33) area=1
+  id=6 B=255(SPAWN) bbox=[29,34,30,35) area=1
+  id=7 B=255(SPAWN) bbox=[34,34,35,35) area=1
+  [TRUNCATED: 1 more non-HALT components; use components or instructions]
+Queries: point, scanline, region, field, instructions, find, components, edges, diff, rebuild, verify

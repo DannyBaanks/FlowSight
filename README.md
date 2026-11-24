@@ -1,73 +1,89 @@
-# FlowSight — primer experimento de «visión» sin modelo visual
+# FlowSight — periférico de inspección espacial y estructural para agentes solo-texto
 
-**M0, experimental, no integrado ni fusionado con FLOW.** Un traductor de imágenes PNG de colores discretos a una memoria espacial SQLite consultable por un agente **solo-texto**. Puede preguntar por colores, posiciones, regiones y cambios sin recibir un JSON por píxel. Incluye exportación al subconjunto **CANVAS / COLOR / RECT** de `.flowpaint` y reconstrucción exacta del PNG a nivel de píxeles RGBA decodificados.
+**M1 (repositorio independiente, periférico de solo lectura sobre `FLOW` y `FlowGen`).**
+`FlowSight` traduce imágenes PNG en una memoria espacial SQLite lossless y consultable por fóvea (L0 global acotado → L1 consultas regionales → L2 reconstrucción/verificación exacta), sin modificar los núcleos de `FLOW` ni `FlowGen` y sin usar modelos visuales ni APIs remotas.
 
-## Contratos que conservamos
+> La línea base **M0** y toda su evidencia original se conservan íntegras en [`evidence/m0/`](evidence/m0/) y en el commit inicial del repositorio.
 
-- FLOW (repo `DannyBaanks/FLOW`) usa **R/G como campo vectorial** y **B como instrucciones**, por lo que una imagen visual cualquiera **no** es directamente un programa FLOW. `index --mode flow` explica estos canales, pero no ejecuta la VM.
-- `flow.paint.painter.run_paint_program` ya admite `CANVAS`, `COLOR`, `RECT`. Este prototipo exporta ese subconjunto. **Validado aquí con un intérprete independiente del subconjunto; todavía falta ejecutarlo contra el painter real de FLOW en la máquina del usuario.**
-- Sin extracción semántica de objetos, OCR ni embeddings; «verde» es dato RGB, «ojo» sería una inferencia no demostrada. **No garantiza visión perceptual humana.**
-- Sin modificación de FLOW, FlowGen, ISyMCP ni ISyMem. Sin red, sin LLM, sin APIs remotas.
+---
 
-## Instalación
+## Dos modos lossless explícitos
 
-Python ≥3.10 y Pillow (el mismo tipo de dependencia que FLOW):
+### 1. `--mode flow` — Índice nativo de 3 canales para programas FLOW (`flowsight-flow-v1`)
+Los programas FLOW (`DannyBaanks/FLOW`) codifican **dos capas distintas en la misma imagen RGB**:
+- **Canales `R, G` (campo vectorial continuo):** almacenados **sin pérdida ni cuantización** como arrays `uint8` exactos (`vx = R/127.5 - 1`, `vy = G/127.5 - 1`), acompañados de resúmenes espaciales deterministas por tiles, estadísticas regionales exactas (media, magnitud, coherencia, divergencia y rotacional/curl en diferencias finitas exactas) y grillas direccionales.
+- **Canal `B` (instrucciones y datos discretos `0..255`):** almacenado en RLE exacto por fila, paleta de opcodes, componentes 4-conexos y tabla directa de `spawns` (`B=255`).
+- **Sin rechazo por >64 colores RGB:** programas reales como `FLOW/examples/vortex.png` (873 colores RGB distintos) y `FLOW/examples/hello_flow.png` se indexan y reconstruyen con **0 errores en R, G y B**, manteniendo invariantes las trazas de la VM real de FLOW.
+- **Aclaración epistémica:** el mapa de flechas por tile en L0 y `field` es un *resumen aproximado* de la media local; los valores exactos sin cuantizar se consultan con `point`, `scanline`, `region`, `field` e `instructions`. FlowSight observa el programa estático y **nunca ejecuta la VM de FLOW**.
+
+### 2. `--mode visual` — Índice raster discreto (`flowsight-rle-v1`) + mejoras de fóvea M1
+Para pixel art, sprites y diagramas discretos (PNG, 1..512 por lado, ≤64 colores RGBA exactos; rechaza >64 colores sin cuantizar silenciosamente):
+- `summary` (L0): paleta en orden determinista, minimapa `24×16` por mayoría (≥60% o `?`), **marcadores explícitos `[hidden-in-minimap]` con `bbox` exacto para colores minoritarios** ausentes del minimapa, y top componentes 4-conexos.
+- `region X Y W H --grid`: vista simbólica **1:1 exacta** para fóveas pequeñas (límite fail-closed: ≤64×64 y ≤1024 px).
+- `edges --region X Y W H`: fronteras discretas `V`/`H` acotadas a una caja sin truncamiento global.
+- `diff`: reporta `CHANGED BBOX` y **transiciones exactas de color** (`C_old(#hex) -> C_new(#hex)`).
+- `export-flowpaint`: exporta al subconjunto `CANVAS / COLOR / RECT` compatible con `flow.paint.painter.run_paint_program`.
+
+---
+
+## Instalación y pruebas
+
+Requisitos: Python ≥3.10 y `Pillow`.
 
 ```bash
-python -m pip install Pillow
-python examples/make_examples.py
-python examples/benchmark.py
-python -m unittest discover -s tests -v
+python3 -m pip install -r requirements.txt
+
+# Suite completa (con FLOW en PYTHONPATH se ejecutan también los gates nativos)
+PYTHONPATH="/home/danny/Development/ISyCo Git/FLOW:." python3 -m unittest discover -s tests -v
+
+# Benchmark y gates de M1 Prioridad 1 sobre programas FLOW reales
+python3 examples/benchmark_m1_p1.py
 ```
 
-## CLI (fóvea en lugar de JSON gigante)
+---
+
+## CLI
 
 ```bash
-python flowsight.py index examples/sprite.png demo.sqlite
-python flowsight.py summary demo.sqlite
-python flowsight.py point demo.sqlite 15 24
-python flowsight.py scanline demo.sqlite 24
-python flowsight.py region demo.sqlite 12 20 12 10
-python flowsight.py find demo.sqlite '#2ecc71'
-python flowsight.py components demo.sqlite
-python flowsight.py edges demo.sqlite --limit 40
-python flowsight.py diff demo.sqlite examples/sprite_edited.png
-python flowsight.py verify demo.sqlite examples/sprite.png
-python flowsight.py rebuild demo.sqlite reconstructed.png
-python flowsight.py export-flowpaint demo.sqlite reconstructed.flowpaint
+# --- Programas FLOW (nativo 3 canales, lossless) ---
+python3 flowsight.py index "/home/danny/Development/ISyCo Git/FLOW/examples/vortex.png" vortex.sqlite --mode flow
+python3 flowsight.py summary vortex.sqlite
+python3 flowsight.py field vortex.sqlite --region 16 16 32 32 --cols 8 --rows 8
+python3 flowsight.py instructions vortex.sqlite --limit 20
+python3 flowsight.py region vortex.sqlite 30 30 5 5 --grid
+python3 flowsight.py point vortex.sqlite 32 29
+python3 flowsight.py scanline vortex.sqlite 29
+python3 flowsight.py verify vortex.sqlite "/home/danny/Development/ISyCo Git/FLOW/examples/vortex.png"
+python3 flowsight.py rebuild vortex.sqlite vortex_rebuilt.png
 
-# Programas FLOW: sus canales son CÓDIGO y campo, no color visual arbitrario
-python flowsight.py index examples/flow_hello.png hello.sqlite --mode flow
-python flowsight.py point hello.sqlite 2 2
+# --- Imágenes visuales discretas (<=64 colores RGBA) ---
+python3 flowsight.py index examples/sprite.png sprite.sqlite
+python3 flowsight.py summary sprite.sqlite
+python3 flowsight.py region sprite.sqlite 12 20 12 10 --grid
+python3 flowsight.py edges sprite.sqlite --region 12 20 12 10
+python3 flowsight.py diff sprite.sqlite examples/sprite_edited.png
+python3 flowsight.py export-flowpaint sprite.sqlite sprite.flowpaint
 ```
 
-La salida global `summary` es un **minimapa textual** (24×16 como máximo), una leyenda RGB y un máximo de siete cajas de regiones. Los demás detalles se consultan por coordenadas; `edges` extrae segmentos discretos verticales/horizontales exactamente en fronteras de color (no son contornos semánticos de objetos). La paleta y los RLE completos quedan en SQLite: **la salida textual no necesita contenerlos todos**. En cada comando se indican truncamientos si excede el límite de líneas.
+---
 
-## Sistema de coordenadas y precisión
+## Sistema de coordenadas y garantías fail-closed
 
-Origen (0,0) en esquina superior izquierda; `x` aumenta hacia la derecha, `y` hacia abajo. Cajas `[x0,y0,x1,y1)` con extremos finales *exclusivos*; `region` acepta `x y ancho alto`. Colores RGBA exactos, incluyendo transparencia. La comparación y SHA-256 se realizan sobre **RGBA descomprimido**, no sobre los bytes PNG, que pueden diferir por metadata y compresión.
+- Origen `(0,0)` en esquina superior izquierda; `x` aumenta hacia la derecha, `y` hacia abajo; cajas `[x0, y0, x1, y1)` con extremos finales **exclusivos**.
+- Verificación de integridad SHA-256 por canal (`r_sha256`, `g_sha256`, `b_sha256`, `rgb_sha256`, `rgba_sha256`) al abrir y reconstruir.
+- Escritura atómica vía archivo temporal + `os.replace`; lectura en SQLite `?mode=ro`; nunca sobrescribe sin `--force`.
+- Determinismo byte a byte en índices SQLite, resúmenes L0 y salidas de consulta.
+- **Límites explícitos (`NOT_DEMONSTRATED`):** no hace reconocimiento semántico de fotos/objetos humanos, no hace OCR, no cuantiza imágenes >64 colores en `--mode visual`, ni predice la ejecución dinámica multi-tick de la VM de FLOW sin ejecutarla.
 
-## Reglas de seguridad y límites explícitos
+---
 
-- Solo PNG, dimensiones 1..512 y hasta **64 colores RGBA diferentes**. Si supera ese límite se **rechaza** sin cuantizar silenciosamente. Foto y screenshots complejos quedan para M1.
-- Una consulta nunca inventa identidad de objetos ni coordenadas. Objetos geométricos = componentes **4-conexos**, no clasificación semántica.
-- Solo los 64 componentes conectados más grandes se almacenan individualmente; `summary` informa recuento total y truncamiento.
-- `export-flowpaint` limita por defecto a 50,000 instrucciones RECT **y a 64 MiB de snapshots UNDO potenciales**: el painter actual de FLOW conserva hasta 1024 snapshots completos y podría agotar RAM con canvas grandes. Para reconstruir PNG grande usa `rebuild`, que no usa el painter.
-- Rechaza rutas de salida existentes salvo `--force`; trabaja sobre copia de datos. SQLite se crea de manera temporal y se publica al final del indexado.
-- Las métricas de ahorro son bytes de salida del prototipo comparados con JSON por píxel, **no tokens medidos por tokenizer ni ahorro facturado**.
+## Evidencia y reportes
 
-## Evidencia y experimentación con un LLM text-only
-
-Ejecuta `python examples/benchmark.py`: genera `reports/benchmark.json`, `reports/*_L0.txt`, `reports/queries.txt`, `.flowpaint` y PNG reconstruidos. Los PNG reconstruidos se comparan por píxeles en los tests. Después sigue [EXPERIMENTO_CIEGO.md](EXPERIMENTO_CIEGO.md) para evaluar al agente sin mostrarle el PNG, comparando sus respuestas con un oráculo de consultas deterministas.
-
-## Próximos gates (todavía NO DEMOSTRADOS)
-
-1. Ejecutar `.flowpaint` exportado con el `run_paint_program` real de FLOW en la máquina de Danny; comparar bytes RGBA decodificados contra original.
-2. Probar con un **modelo realmente text-only** en una sesión sin acceso a imágenes: preguntas de color, posición, simetría e identidad de objetos y reportar la matriz correcta/incorrecta/indeterminable.
-3. Incorporar `crop`, contornos, quadtree y detección de primitivas (no solo componentes), garantizando límites de salida por operación.
-4. Para fotos y UI: segmentación/agrupamiento **aproximados**, métricas de error y OCR opcional explícito; NO declarar pixel-exacto si hay cuantización.
-5. Contrato MCP para preguntas L0/L1/L2 y trazas de consultas, sin modificar el core de FLOW.
+- [`evidence/m0/`](evidence/m0/) — Evidencia original M0 intacta (`GATES.md`, `M0_SHA256SUMS.txt`, benchmarks y artefactos).
+- [`evidence/m1_p1/`](evidence/m1_p1/) — Benchmark, índices, L0 y verificación de gates M1 Prioridad 1 sobre `hello_flow.png` y `vortex.png`.
+- [`evidence/m1_blind/`](evidence/m1_blind/) — Transcripts completos y auditoría de los experimentos ciegos M1 (`m1_a_vortex`, `m1_b_hello_flow`, `m1_c_visual_p2`).
+- [`reports/GATES_M1.md`](reports/GATES_M1.md) — Matriz consolidada de resultados clasificados como `DEMONSTRATED`, `INFERRED` o `NOT_DEMONSTRATED`.
 
 ## Licencia
 
-CC0 / dominio público, alineado con FLOW y FlowGen.
+CC0 / dominio público, alineado con `FLOW` y `FlowGen`.

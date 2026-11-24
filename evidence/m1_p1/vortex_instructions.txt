@@ -1,0 +1,11 @@
+FLOW INSTRUCTIONS scope=[0,0,64,64) filter=non-HALT (B!=0) matches=8
+COUNTS: B=255(SPAWN):8
+CELLS + LOCAL VECTOR + 1-CELL STEP ALONG UNIT VECTOR (static spatial relation, NOT VM simulation):
+  ( 29, 29) B=255 SPAWN   | RG=(217, 37) v=(+0.702,-0.710) mag=0.998 NE   -> (30,28) B=0(HALT)
+  ( 32, 29) B=255 SPAWN   | RG=(255,127) v=(+1.000,-0.004) mag=1.000 E    -> (33,29) B=0(HALT)
+  ( 34, 29) B=255 SPAWN   | RG=(217,217) v=(+0.702,+0.702) mag=0.993 SE   -> (35,30) B=0(HALT)
+  ( 29, 32) B=255 SPAWN   | RG=(127,  0) v=(-0.004,-1.000) mag=1.000 N    -> (29,31) B=0(HALT)
+  ( 35, 32) B=255 SPAWN   | RG=(127,255) v=(-0.004,+1.000) mag=1.000 S    -> (35,33) B=0(HALT)
+  ( 29, 34) B=255 SPAWN   | RG=( 37, 37) v=(-0.710,-0.710) mag=1.004 NW   -> (28,33) B=0(HALT)
+  ( 34, 34) B=255 SPAWN   | RG=( 37,217) v=(-0.710,+0.702) mag=0.998 SW   -> (33,35) B=0(HALT)
+  ( 32, 35) B=255 SPAWN   | RG=(  0,127) v=(-1.000,-0.004) mag=1.000 W    -> (31,35) B=0(HALT)

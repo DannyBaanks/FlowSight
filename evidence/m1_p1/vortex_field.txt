@@ -1,0 +1,26 @@
+FLOW FIELD [0,0,64,64) exact cells=4096 | unquantized R/G
+SUMMARY: active(|v|>=0.02)=4091/4096 (99.9%) | R=[0..255] G=[0..255]
+VECTOR: mean_v=(+0.00989,-0.01752) net_mag=0.02012 mean_mag=0.99870 min_mag=0.00555 max_mag=1.01059 coherence=0.02015 deg=-60.6
+DIFFERENTIALS: mean_div=-0.00000 mean_curl=+0.05594 (screen y-down: curl>0=CW rotation, curl<0=CCW rotation)
+QUADRANTS (exact means):
+  TL [0,0,32,32): mean_v=(+0.648,-0.656) mag=1.000 coh=0.922 dir=NE
+  TR [32,0,64,32): mean_v=(+0.665,+0.621) mag=0.994 coh=0.915 dir=SE
+  BL [0,32,32,64): mean_v=(-0.629,-0.673) mag=1.004 coh=0.917 dir=NW
+  BR [32,32,64,64): mean_v=(-0.645,+0.638) mag=0.997 coh=0.910 dir=SW
+DIRECTION GRID 16x16 (APPROXIMATE tile mean; *=coh<0.35, .=mag<0.05):
+  ↗↗↗↗↗→→→→→→↘↘↘↘↘
+  ↗↗↗↗↗→→→→→→↘↘↘↘↘
+  ↗↗↗↗↗↗→→→→↘↘↘↘↘↘
+  ↗↗↗↗↗↗→→→→↘↘↘↘↘↘
+  ↗↗↗↗↗↗↗→→→↘↘↘↘↘↘
+  ↑↑↗↗↗↗↗→→↘↘↘↘↘↓↓
+  ↑↑↑↑↗↗↗→→↘↘↘↓↓↓↓
+  ↑↑↑↑↑↑↑↗↘↘↓↓↓↓↓↓
+  ↑↑↑↑↑↑↑↖↙↓↓↓↓↓↓↓
+  ↑↑↑↑↑↖↖↖←↙↙↓↓↓↓↓
+  ↑↑↖↖↖↖↖←←↙↙↙↙↙↓↓
+  ↖↖↖↖↖↖↖←←←↙↙↙↙↙↙
+  ↖↖↖↖↖↖←←←←↙↙↙↙↙↙
+  ↖↖↖↖↖↖←←←←↙↙↙↙↙↙
+  ↖↖↖↖↖←←←←←←↙↙↙↙↙
+  ↖↖↖↖↖←←←←←←↙↙↙↙↙

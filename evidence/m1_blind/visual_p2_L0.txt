@@ -1,0 +1,37 @@
+FLOWSIGHT v1 | 64x64 RGBA | mode=visual | SHA256(decoded)=e4cbdad2199b0e8d
+Coordinates: origin top-left (0,0); x right, y down; regions [x0,y0,x1,y1) exclusive.
+Palette (observed colors, no inferred object identity):
+  0=C0 #0a0c12ff 3709/4096 (90.6%)
+  1=C1 #3498dbff 233/4096 (5.7%)
+  2=C2 #f1c40fff 152/4096 (3.7%)
+  3=C3 #2ecc71ff 1/4096 (0.0%) [hidden-in-minimap]
+  4=C4 #e74c3cff 1/4096 (0.0%) [hidden-in-minimap]
+Minimap 24x16 (tile majority; ? if winning color < 60%):
+  000000000000000000000000
+  00000000000000000000?000
+  000000000000000000011000
+  00000000000000000?1?0000
+  000000000000000011000000
+  000000000????????0000000
+  000000002000011?00000000
+  00000000200?1?0?00000000
+  000000002011000?00000000
+  0000000021?0000?00000000
+  00000001???????200000000
+  00000?1?0000000000000000
+  000011000000000000000000
+  00?1?0000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+Minority colors absent from minimap (2 total, exact bbox):
+  3=C3 #2ecc71ff pixels=1 bbox=[12,14,13,15)
+  4=C4 #e74c3cff pixels=1 bbox=[50,50,51,51)
+Components (4-connected): 9; largest 9 indexed:
+  C0 bbox=[0,0,64,64) area=3495
+  C2 bbox=[22,22,43,43) area=152
+  C0 bbox=[25,25,41,41) area=136
+  C1 bbox=[39,5,58,22) area=79
+  C1 bbox=[5,39,22,58) area=79
+  C0 bbox=[24,24,36,36) area=78
+  C1 bbox=[24,24,41,41) area=75
+Queries: point, scanline, region [--grid], find, edges [--region], components, diff, export-flowpaint, rebuild, verify
