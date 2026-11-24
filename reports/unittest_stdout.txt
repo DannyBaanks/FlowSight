@@ -1,0 +1,18 @@
+test_corrupted_index_detected (test_flowsight.FlowSightTests.test_corrupted_index_detected) ... ok
+test_diff_exact (test_flowsight.FlowSightTests.test_diff_exact) ... ok
+test_export_flowpaint_exact_pixel_reconstruction (test_flowsight.FlowSightTests.test_export_flowpaint_exact_pixel_reconstruction) ... ok
+test_fail_closed_high_color_image (test_flowsight.FlowSightTests.test_fail_closed_high_color_image) ... ok
+test_find_exact_palette (test_flowsight.FlowSightTests.test_find_exact_palette) ... ok
+test_flow_program_decode (test_flowsight.FlowSightTests.test_flow_program_decode) ... ok
+test_index_and_roundtrip_rebuild (test_flowsight.FlowSightTests.test_index_and_roundtrip_rebuild) ... ok
+test_no_overwrite_without_force (test_flowsight.FlowSightTests.test_no_overwrite_without_force) ... ok
+test_point_and_scanline (test_flowsight.FlowSightTests.test_point_and_scanline) ... ok
+test_region_coverage_exact (test_flowsight.FlowSightTests.test_region_coverage_exact) ... ok
+test_summary_is_bounded_and_has_minimap (test_flowsight.FlowSightTests.test_summary_is_bounded_and_has_minimap) ... ok
+test_vector_edges_are_grounded (test_flowsight.FlowSightTests.test_vector_edges_are_grounded) ... ok
+test_generated_flowpaint_exact_rgba (test_native_flow_optional.NativeFlowIntegration.test_generated_flowpaint_exact_rgba) ... skipped 'FLOW painter not installed here; native gate NOT_DEMONSTRATED'
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.121s
+
+OK (skipped=1)

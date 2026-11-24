@@ -1,0 +1,34 @@
+FLOWSIGHT v1 | 64x48 RGBA | mode=visual | SHA256(decoded)=21a2cee1a902b4ab
+Coordinates: origin top-left (0,0); x right, y down; regions [x0,y0,x1,y1) exclusive.
+Palette (observed colors, no inferred object identity):
+  0=C0 #0c0c12ff 1798/3072 (58.5%)
+  1=C1 #2ecc71ff 569/3072 (18.5%)
+  2=C2 #e74c3cff 503/3072 (16.4%)
+  3=C3 #f6dd4aff 132/3072 (4.3%)
+  4=C4 #ebebf5ff 70/3072 (2.3%)
+Minimap 24x16 (tile majority; ? if winning color < 60%):
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  001111111110022222222200
+  001333333310022333332200
+  001111111110022222222200
+  001111111110022222222200
+  00111?4411100222?4422200
+  001114441110022244422200
+  001111111110022222222200
+  001111111110022222222200
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+Components (4-connected): 7; largest 7 indexed:
+  C0 bbox=[0,0,64,48) area=1798
+  C1 bbox=[4,8,30,34) area=569
+  C2 bbox=[35,8,58,34) area=503
+  C3 bbox=[8,12,26,16) area=72
+  C3 bbox=[39,12,54,16) area=60
+  C4 bbox=[14,22,21,27) area=35
+  C4 bbox=[43,22,50,27) area=35
+Queries: point, scanline, region, find, edges, components, diff, export-flowpaint, rebuild, verify

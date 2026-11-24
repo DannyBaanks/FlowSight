@@ -1,0 +1,3 @@
+Generated examples/sprite.png, sprite_edited.png, flow_hello.png
+sprite     64x48 | 5 colors | 188 runs | 23 RECT | L0 1242 B vs naive JSON 145379 B | index 36864 B | 15.21 ms | pixel_exact=True
+flow_hello 32x16 | 5 colors | 21 runs | 8 RECT | L0 1243 B vs naive JSON 24098 B | index 36864 B | 10.48 ms | pixel_exact=True

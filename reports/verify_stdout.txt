@@ -1,0 +1,2 @@
+PASS index integrity: decoded rgba_sha256=21a2cee1a902b4ab644fc6b9fb89f4417fb2807b94a98d08797b315ea031d0ad
+PASS input: exact decoded RGBA byte equality

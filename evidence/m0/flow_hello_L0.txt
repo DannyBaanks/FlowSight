@@ -1,0 +1,33 @@
+FLOWSIGHT v1 | 32x16 RGBA | mode=flow | SHA256(decoded)=5127fefcc0093afb
+Coordinates: origin top-left (0,0); x right, y down; regions [x0,y0,x1,y1) exclusive.
+Palette (observed colors, no inferred object identity):
+  0=C0 #808000ff 503/512 (98.2%)
+  1=C1 #ff8002ff 5/512 (1.0%)
+  2=C2 #ff8000ff 2/512 (0.4%)
+  4=C4 #ff80ffff 1/512 (0.2%)
+  3=C3 #ff8005ff 1/512 (0.2%)
+Minimap 24x16 (tile majority; ? if winning color < 60%):
+  000000000000000000000000
+  000000000000000000000000
+  00?11132?000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+  000000000000000000000000
+Components (4-connected): 5; largest 5 indexed:
+  C0 bbox=[0,0,32,16) area=503
+  C1 bbox=[3,2,8,3) area=5
+  C2 bbox=[9,2,11,3) area=2
+  C4 bbox=[2,2,3,3) area=1
+  C3 bbox=[8,2,9,3) area=1
+Queries: point, scanline, region, find, edges, components, diff, export-flowpaint, rebuild, verify
+FLOW raw channels: R,G define vector ((value/127.5)-1); B defines instruction. NOT image gradients.

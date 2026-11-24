@@ -1,0 +1,106 @@
+=== POINT ===
+(15,24) C4 #ebebf5ff
+
+=== FIND GREEN ===
+#2ecc71ff exact pixels=569 bbox=[4,8,30,34) rows/runs=35
+  y=8 x=[4,30)
+  y=9 x=[4,30)
+  y=10 x=[4,30)
+  y=11 x=[4,30)
+  y=12 x=[4,8)
+  y=12 x=[26,30)
+  y=13 x=[4,8)
+  y=13 x=[26,30)
+  y=14 x=[4,8)
+  y=14 x=[26,30)
+  y=15 x=[4,8)
+  y=15 x=[26,30)
+  y=16 x=[4,30)
+  y=17 x=[4,30)
+  y=18 x=[4,30)
+  y=19 x=[4,30)
+  y=20 x=[4,30)
+  y=21 x=[4,30)
+  y=22 x=[4,14)
+  y=22 x=[21,30)
+  y=23 x=[4,14)
+  y=23 x=[21,30)
+  y=24 x=[4,14)
+  y=24 x=[21,30)
+  y=25 x=[4,14)
+  y=25 x=[21,30)
+  y=26 x=[4,14)
+  y=26 x=[21,30)
+  y=27 x=[4,30)
+  y=28 x=[4,30)
+  y=29 x=[4,30)
+  y=30 x=[4,30)
+  y=31 x=[4,30)
+  y=32 x=[4,30)
+  y=33 x=[4,30)
+
+=== REGION ===
+REGION [12,20,24,30) exact pixels=120, intersecting runs=20
+COVERAGE: C1:85 (70.8%) #2ecc71ff, C4:35 (29.2%) #ebebf5ff
+RLE intersections:
+  y=20 x=[12,24) C1
+  y=21 x=[12,24) C1
+  y=22 x=[12,14) C1
+  y=22 x=[14,21) C4
+  y=22 x=[21,24) C1
+  y=23 x=[12,14) C1
+  y=23 x=[14,21) C4
+  y=23 x=[21,24) C1
+  y=24 x=[12,14) C1
+  y=24 x=[14,21) C4
+  y=24 x=[21,24) C1
+  y=25 x=[12,14) C1
+  y=25 x=[14,21) C4
+  y=25 x=[21,24) C1
+  y=26 x=[12,14) C1
+  y=26 x=[14,21) C4
+  y=26 x=[21,24) C1
+  y=27 x=[12,24) C1
+  y=28 x=[12,24) C1
+  y=29 x=[12,24) C1
+
+=== SCANLINE ===
+y=24 runs=9; x intervals [x0,x1) exclusive:
+  x=[0,4) len=4 C0 #0c0c12ff
+  x=[4,14) len=10 C1 #2ecc71ff
+  x=[14,21) len=7 C4 #ebebf5ff
+  x=[21,30) len=9 C1 #2ecc71ff
+  x=[30,35) len=5 C0 #0c0c12ff
+  x=[35,43) len=8 C2 #e74c3cff
+  x=[43,50) len=7 C4 #ebebf5ff
+  x=[50,58) len=8 C2 #e74c3cff
+  x=[58,64) len=6 C0 #0c0c12ff
+
+=== VECTOR EDGES ===
+INTERNAL COLOR EDGES exact segments=24 (V: left/right; H: above/below).
+  V x=4 y=[8,34) C0->C1
+  V x=8 y=[12,16) C1->C3
+  V x=14 y=[22,27) C1->C4
+  V x=21 y=[22,27) C4->C1
+  V x=26 y=[12,16) C3->C1
+  V x=30 y=[8,34) C1->C0
+  V x=35 y=[8,34) C0->C2
+  V x=39 y=[12,16) C2->C3
+  V x=43 y=[22,27) C2->C4
+  V x=50 y=[22,27) C4->C2
+  V x=54 y=[12,16) C3->C2
+  V x=58 y=[8,34) C2->C0
+  H y=8 x=[4,30) C0->C1
+  H y=8 x=[35,58) C0->C2
+  H y=12 x=[8,26) C1->C3
+  H y=12 x=[39,54) C2->C3
+  H y=16 x=[8,26) C3->C1
+  H y=16 x=[39,54) C3->C2
+  H y=22 x=[14,21) C1->C4
+  H y=22 x=[43,50) C2->C4
+[TRUNCATED 4 edge segments; use cropped index to focus]
+
+=== DIFF ===
+DIFF 64x48 decoded RGBA pixel-changes=3/3072 (0.10%)
+CHANGED BBOX=[16,24,19,25)
+  y=24 x=[16,19)

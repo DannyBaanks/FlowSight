@@ -1,0 +1,16 @@
+# FlowSight v1 | reconstructed from decoded RGBA hash 5127fefcc0093afbdd7dfa06dc4c6be37eab538efced874ff85caa15a48a8125
+# Exact pixel reconstruction in FLOW paint (CANVAS / COLOR / RECT subset).
+CANVAS 32 16
+COLOR c0 128 128 0 255
+COLOR c1 255 128 2 255
+COLOR c2 255 128 0 255
+COLOR c3 255 128 5 255
+COLOR c4 255 128 255 255
+RECT 0 0 32 2 c0
+RECT 0 2 2 1 c0
+RECT 2 2 1 1 c4
+RECT 3 2 5 1 c1
+RECT 8 2 1 1 c3
+RECT 9 2 2 1 c2
+RECT 11 2 21 1 c0
+RECT 0 3 32 13 c0

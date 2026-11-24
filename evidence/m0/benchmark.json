@@ -1,0 +1,38 @@
+[
+  {
+    "name": "sprite",
+    "w": 64,
+    "h": 48,
+    "colors": 5,
+    "runs": 188,
+    "components": 7,
+    "source_png_bytes": 318,
+    "rgba_bytes": 12288,
+    "sqlite_bytes": 36864,
+    "naive_pixel_json_bytes": 145379,
+    "l0_utf8_bytes": 1242,
+    "flowpaint_utf8_bytes": 739,
+    "rects": 23,
+    "index_ms": 15.21,
+    "verified_rgba_hash": "21a2cee1a902b4ab644fc6b9fb89f4417fb2807b94a98d08797b315ea031d0ad",
+    "match": true
+  },
+  {
+    "name": "flow_hello",
+    "w": 32,
+    "h": 16,
+    "colors": 5,
+    "runs": 21,
+    "components": 5,
+    "source_png_bytes": 122,
+    "rgba_bytes": 2048,
+    "sqlite_bytes": 36864,
+    "naive_pixel_json_bytes": 24098,
+    "l0_utf8_bytes": 1243,
+    "flowpaint_utf8_bytes": 457,
+    "rects": 8,
+    "index_ms": 10.48,
+    "verified_rgba_hash": "5127fefcc0093afbdd7dfa06dc4c6be37eab538efced874ff85caa15a48a8125",
+    "match": true
+  }
+]
