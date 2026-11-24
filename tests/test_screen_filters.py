@@ -130,8 +130,8 @@ class ScreenFilterEngineTests(unittest.TestCase):
         # Text bands detected geometrically
         self.assertGreaterEqual(ctx.artifacts['text_bands']['total_detected'], 10)
 
-        # OCR is either OK or explicitly ABSENT (never crashes)
-        self.assertIn(ctx.artifacts['ocr']['status'], ('OK', 'ABSENT'))
+        # OCR is explicitly OCR_OBSERVED/OCR_UNCERTAIN or OCR_ABSENT (never crashes or fakes labels)
+        self.assertIn(ctx.artifacts['ocr']['status'], ('OCR_OBSERVED', 'OCR_UNCERTAIN', 'OCR_ABSENT'))
 
         # Wireframe ASCII map compact
         rep = fscr.format_pipeline_report(ctx)

@@ -223,5 +223,24 @@ def flowsight_screen_run(
         return f'DENY {e}'
 
 
+@mcp.tool(
+    description=(
+        'Bounded targeted query over a screenshot pipeline result without dumping full JSON. '
+        'Selectors: "P0" (panel), "W1" (local control), "K0" (persistent diff track), '
+        '"ambiguities", "ocr", "controls", "layout", "ui_diff".'
+    ),
+)
+def flowsight_screen_query(
+    image_path: str,
+    selector: str,
+    vf: str = 'theme,layout,controls,ocr',
+) -> str:
+    try:
+        ctx = fscr.run_pipeline(image_path, vf=vf)
+        return fscr.query_canonical(ctx, selector)
+    except (fscr.FilterDeny, fb.BlocksDeny) as e:
+        return f'DENY {e}'
+
+
 if __name__ == '__main__':
     mcp.run(transport='stdio')

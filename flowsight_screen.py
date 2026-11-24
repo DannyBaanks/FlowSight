@@ -32,6 +32,9 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 import flowsight_blocks as fb
+import flowsight_diff as fdiff
+import flowsight_ocr as focr
+import flowsight_vlm as fvlm
 
 SCHEMA_SCREEN = 'flowsight-screen-v1'
 MAX_SCREEN_DIM = 8192
@@ -55,6 +58,10 @@ class FilterContext:
     offset_y: int = 0               # global y offset of current crop
     artifacts: dict[str, Any] = field(default_factory=dict)
     trace: list[dict[str, Any]] = field(default_factory=list)
+    ocr_provider: Callable[..., dict[str, Any]] | None = None
+    vlm_policy: fvlm.VLMProbePolicy = field(default_factory=lambda: fvlm.DEFAULT_POLICY)
+    vlm_backend: Callable[..., str] | None = None
+    prev_track_map: dict[str, str] | None = None
 
     @property
     def w(self) -> int:
@@ -68,6 +75,10 @@ class FilterContext:
     def global_bbox(self) -> list[int]:
         return [self.offset_x, self.offset_y, self.offset_x + self.w, self.offset_y + self.h]
 
+    @property
+    def source_frame_id(self) -> str:
+        return f'{self.source_name}:{self.source_sha256[:12]}'
+
     def to_global(self, x0: int, y0: int, x1: int, y1: int) -> list[int]:
         return [self.offset_x + x0, self.offset_y + y0, self.offset_x + x1, self.offset_y + y1]
 
@@ -78,14 +89,43 @@ class FilterSpec:
     summary: str
     syntax: str
     fn: Callable[[FilterContext, dict[str, str]], None]
+    inputs: tuple[str, ...] = ('rgb',)
+    outputs: tuple[str, ...] = ()
+    optional_deps: tuple[str, ...] = ()
+    requires_network: bool = False
+    requires_gpu: bool = False
+    deterministic: bool = True
+    coord_space: str = 'global'
+    provenance: str = 'DEMONSTRATED'
+    degradations: str = 'fail-closed FilterDeny on invalid args'
 
 
 FILTERS: dict[str, FilterSpec] = {}
 
 
-def register_filter(name: str, summary: str, syntax: str):
+def register_filter(
+    name: str,
+    summary: str,
+    syntax: str,
+    *,
+    inputs: tuple[str, ...] = ('rgb',),
+    outputs: tuple[str, ...] = (),
+    optional_deps: tuple[str, ...] = (),
+    requires_network: bool = False,
+    requires_gpu: bool = False,
+    deterministic: bool = True,
+    coord_space: str = 'global',
+    provenance: str = 'DEMONSTRATED',
+    degradations: str = 'fail-closed FilterDeny on invalid args',
+):
     def _dec(fn: Callable[[FilterContext, dict[str, str]], None]):
-        FILTERS[name] = FilterSpec(name=name, summary=summary, syntax=syntax, fn=fn)
+        FILTERS[name] = FilterSpec(
+            name=name, summary=summary, syntax=syntax, fn=fn,
+            inputs=inputs, outputs=outputs, optional_deps=optional_deps,
+            requires_network=requires_network, requires_gpu=requires_gpu,
+            deterministic=deterministic, coord_space=coord_space,
+            provenance=provenance, degradations=degradations,
+        )
         return fn
     return _dec
 
@@ -610,57 +650,80 @@ def _f_text_bands(ctx: FilterContext, params: dict[str, str]) -> None:
 
 @register_filter(
     'ocr',
-    'Optional OCR filter (uses local tesseract if installed; fail-closed ABSENT otherwise)',
-    'ocr[=lang=eng]',
+    'Local OCR (Tesseract) + geometric text-control association (TEXT_INSIDE/LABEL_ASSOCIATED/AMBIGUOUS/NO_TEXT_EVIDENCE)',
+    'ocr[=lang=eng:min_conf=60]',
+    inputs=('rgb', 'optional:layout', 'optional:controls'),
+    outputs=('ocr', 'text_control_association'),
+    optional_deps=('tesseract',),
+    requires_network=False,
+    requires_gpu=False,
+    deterministic=True,
+    coord_space='global',
+    provenance='DEMONSTRATED (OCR_OBSERVED) / UNCERTAIN (OCR_UNCERTAIN) / ABSENT (OCR_ABSENT)',
+    degradations='returns OCR_ABSENT when tesseract is missing; never invents text',
 )
 def _f_ocr(ctx: FilterContext, params: dict[str, str]) -> None:
-    tess = shutil.which('tesseract')
-    if not tess:
-        ctx.artifacts['ocr'] = {
-            'status': 'ABSENT',
-            'detail': 'tesseract binary not installed on PATH; install tesseract-ocr to enable text reading (no hallucinated OCR)',
-            'lines': [],
-        }
-        return
     lang = params.get('lang') or params.get('_0') or 'eng'
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix='.png') as tf:
-        Image.fromarray(ctx.rgb, mode='RGB').save(tf.name, format='PNG')
-        proc = subprocess.run(
-            [tess, tf.name, 'stdout', '-l', lang, '--psm', '11', 'tsv'],
-            capture_output=True, text=True, timeout=30,
-        )
-    if proc.returncode != 0:
-        ctx.artifacts['ocr'] = {'status': 'ERROR', 'detail': proc.stderr.strip()[:200], 'lines': []}
-        return
-    # Group TSV words by (block, par, line)
-    grouped: dict[tuple[str, str, str], list[dict]] = {}
-    for ln in proc.stdout.splitlines()[1:]:
-        cols = ln.split('\t')
-        if len(cols) < 12:
-            continue
-        txt = cols[11].strip()
-        try:
-            conf = float(cols[10])
-            x, y, bw, bh = int(cols[6]), int(cols[7]), int(cols[8]), int(cols[9])
-        except ValueError:
-            continue
-        if not txt or conf < 35.0:
-            continue
-        key = (cols[2], cols[3], cols[4])
-        grouped.setdefault(key, []).append({'x0': x, 'y0': y, 'x1': x + bw, 'y1': y + bh, 'text': txt, 'conf': conf})
+    min_conf = float(_int_param(params, 'min_conf', 1, 60, 0, 100))
+    psm = _int_param(params, 'psm', None, 11, 3, 13)
+    res = focr.run_ocr(
+        ctx.rgb,
+        offset_x=ctx.offset_x,
+        offset_y=ctx.offset_y,
+        source_frame=ctx.source_frame_id,
+        lang=lang,
+        min_observed_conf=min_conf,
+        psm=psm,
+        provider=ctx.ocr_provider,
+    )
+    # Backward-compatible alias `lines` pointing to `items`
+    res['lines'] = res.get('items', [])
+    ctx.artifacts['ocr'] = res
 
-    lines_out = []
-    for words in grouped.values():
-        x0 = min(w['x0'] for w in words)
-        y0 = min(w['y0'] for w in words)
-        x1 = max(w['x1'] for w in words)
-        y1 = max(w['y1'] for w in words)
-        text = ' '.join(w['text'] for w in words)
-        conf = round(sum(w['conf'] for w in words) / len(words), 1)
-        lines_out.append({'global_bbox': ctx.to_global(x0, y0, x1, y1), 'text': text, 'conf': conf})
-    lines_out.sort(key=lambda r: (r['global_bbox'][1] // 10, r['global_bbox'][0]))
-    ctx.artifacts['ocr'] = {'status': 'OK', 'backend': tess, 'lang': lang, 'lines': lines_out[:60]}
+    # If controls were already extracted earlier in the pipeline, associate text immediately
+    if 'controls' in ctx.artifacts:
+        panels = ctx.artifacts.get('layout', {}).get('panels', [])
+        assoc = focr.associate_text_to_controls(
+            ctx.artifacts['controls']['controls'],
+            res,
+            panels=panels,
+        )
+        ctx.artifacts['controls']['controls'] = assoc['controls']
+        ctx.artifacts['text_control_association'] = {
+            'elapsed_ms': assoc['elapsed_ms'],
+            'ambiguities': assoc['ambiguities'],
+            'unmatched_ocr_ids': assoc['unmatched_ocr_ids'],
+        }
+
+
+@register_filter(
+    'vlm_probe',
+    'Optional crop-only VLM semantic escalation contract (DISABLED by default; fail-closed)',
+    'vlm_probe[=question=...:model=...]',
+    inputs=('rgb', 'crop'),
+    outputs=('vlm_probe',),
+    optional_deps=('authorized_vlm_backend',),
+    requires_network=True,
+    requires_gpu=False,
+    deterministic=False,
+    coord_space='global',
+    provenance='VLM_INFERRED',
+    degradations='returns VLM_DISABLED by default; refuses full-frame transfers',
+)
+def _f_vlm_probe(ctx: FilterContext, params: dict[str, str]) -> None:
+    question = params.get('question') or params.get('_0') or 'Describe the cropped UI element.'
+    model = params.get('model') or params.get('_1') or ''
+    raw_bytes = ctx.rgb.tobytes()
+    req = fvlm.VLMProbeRequest(
+        source_sha256=ctx.source_sha256,
+        full_size=(ctx.full_w, ctx.full_h),
+        global_bbox=tuple(ctx.global_bbox),
+        crop_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        question=question,
+        model=model,
+    )
+    res = fvlm.execute_vlm_probe(raw_bytes, req, policy=ctx.vlm_policy, backend=ctx.vlm_backend)
+    ctx.artifacts['vlm_probe'] = res.to_dict()
 
 
 @register_filter(
@@ -729,8 +792,17 @@ def _f_ui_map(ctx: FilterContext, params: dict[str, str]) -> None:
 
 @register_filter(
     'ui_diff',
-    'Compare current screen against a reference screenshot, grouping changed UI regions by panel & control',
+    'Identity-based temporal UI diff (persistent K-tracks, global optimal matching, pixel regions, both frames preserved)',
     'ui_diff=path_to_before.png',
+    inputs=('rgb', 'optional:layout', 'optional:controls', 'optional:ocr'),
+    outputs=('ui_diff',),
+    optional_deps=('tesseract',),
+    requires_network=False,
+    requires_gpu=False,
+    deterministic=True,
+    coord_space='global',
+    provenance='MIXED (DEMONSTRATED geometry/color/OCR + INFERRED STATE_CHANGED_CANDIDATE)',
+    degradations='declares AMBIGUOUS_MATCH on tied candidates; rejects mismatched frame sizes',
 )
 def _f_ui_diff(ctx: FilterContext, params: dict[str, str]) -> None:
     ref_path = params.get('ref') or params.get('_0')
@@ -742,6 +814,47 @@ def _f_ui_diff(ctx: FilterContext, params: dict[str, str]) -> None:
             f'ui_diff requires same full size: ref {ref_full.shape[1]}x{ref_full.shape[0]} vs {ctx.full_w}x{ctx.full_h}'
         )
     ref_crop = ref_full[ctx.offset_y:ctx.offset_y + ctx.h, ctx.offset_x:ctx.offset_x + ctx.w]
+
+    # Reuse current frame B layout/controls/ocr if already computed; run missing ones cleanly
+    if 'layout' not in ctx.artifacts:
+        _f_layout(ctx, {})
+    if 'controls' not in ctx.artifacts:
+        _f_controls(ctx, {})
+    use_ocr = 'ocr' in ctx.artifacts
+
+    # Extract Frame A (reference) with identical crop/offset and stages (never mutating Frame B!)
+    ref_ctx = FilterContext(
+        source_path=str(Path(ref_path).resolve()),
+        source_name=ref_name,
+        source_sha256=ref_sha,
+        full_w=ctx.full_w,
+        full_h=ctx.full_h,
+        rgb=ref_crop,
+        offset_x=ctx.offset_x,
+        offset_y=ctx.offset_y,
+        ocr_provider=ctx.ocr_provider,
+    )
+    _f_layout(ref_ctx, {})
+    _f_controls(ref_ctx, {})
+    if use_ocr:
+        _f_ocr(ref_ctx, {'lang': ctx.artifacts['ocr'].get('lang', 'eng')})
+
+    panels_a = ref_ctx.artifacts['layout']['panels']
+    panels_b = ctx.artifacts['layout']['panels']
+    controls_a = ref_ctx.artifacts['controls']['controls']
+    controls_b = ctx.artifacts['controls']['controls']
+
+    # Identity-based global optimal temporal matching (persistent track=K0..Kn)
+    tracking = fdiff.match_controls_temporal(
+        controls_a=controls_a,
+        controls_b=controls_b,
+        panels_a=panels_a,
+        panels_b=panels_b,
+        screen_size=(ctx.full_w, ctx.full_h),
+        prev_track_map=ctx.prev_track_map,
+    )
+
+    # Pixel-level changed regions D0..Dn linked to persistent tracks & panels
     delta = np.mean(np.abs(ctx.rgb.astype(np.int16) - ref_crop.astype(np.int16)), axis=2)
     mask = (delta >= 12.0).astype(np.uint8) * 255
     changed_px = int(np.count_nonzero(mask))
@@ -751,8 +864,7 @@ def _f_ui_diff(ctx: FilterContext, params: dict[str, str]) -> None:
     merged = cv2.dilate(mask, k, iterations=1)
     cnts, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    panels = ctx.artifacts.get('layout', {}).get('panels', [])
-    controls = ctx.artifacts.get('controls', {}).get('controls', [])
+    track_by_b_local = tracking['frame_b_tracks']
     regions = []
     for cnt in cnts:
         x, y, bw, bh = cv2.boundingRect(cnt)
@@ -765,25 +877,48 @@ def _f_ui_diff(ctx: FilterContext, params: dict[str, str]) -> None:
         old_med = [int(np.median(ref_crop[y:y + bh, x:x + bw][sub_m, ch])) for ch in range(3)]
         new_med = [int(np.median(ctx.rgb[y:y + bh, x:x + bw][sub_m, ch])) for ch in range(3)]
         gb = ctx.to_global(x, y, x + bw, y + bh)
-        in_p = next((p['id'] for p in panels if _box_contains(p['global_bbox'], gb, 0.55)), None)
-        hit_w = [c['id'] for c in controls if _box_contains(gb, c['global_bbox'], 0.40) or _box_contains(c['global_bbox'], gb, 0.40)]
+        in_p = next((p['id'] for p in panels_b if _box_contains(p['global_bbox'], gb, 0.55)), None)
+        hit_w = [
+            c['id'] for c in controls_b
+            if _box_contains(gb, c['global_bbox'], 0.40) or _box_contains(c['global_bbox'], gb, 0.40)
+        ]
+        hit_tracks = [track_by_b_local[w_id] for w_id in hit_w if w_id in track_by_b_local]
         regions.append({
             'global_bbox': gb,
             'changed_pixels': c_cnt,
             'old_hex': _hex(old_med),
+            'old_family': fb._hsv_family(*old_med),
             'new_hex': _hex(new_med),
+            'new_family': fb._hsv_family(*new_med),
             'inside_panel': in_p,
             'overlapping_controls': hit_w[:4],
+            'overlapping_tracks': hit_tracks[:4],
         })
     regions.sort(key=lambda r: -r['changed_pixels'])
     for i, r in enumerate(regions[:12]):
         r['id'] = f'D{i}'
 
     ctx.artifacts['ui_diff'] = {
+        'frame_a': {
+            'source_name': ref_name,
+            'source_sha256': ref_sha,
+            'control_count': len(controls_a),
+            'controls': [fdiff._control_snapshot(c, tracking['frame_a_tracks'][c['id']]) for c in controls_a],
+        },
+        'frame_b': {
+            'source_name': ctx.source_name,
+            'source_sha256': ctx.source_sha256,
+            'control_count': len(controls_b),
+            'controls': [
+                fdiff._control_snapshot(c, tracking['frame_b_tracks'].get(c['id'], 'AMBIGUOUS'))
+                for c in controls_b
+            ],
+        },
         'reference_name': ref_name,
         'reference_sha256': ref_sha[:16],
         'changed_pixels': changed_px,
         'changed_pct': round(changed_px * 100.0 / total_px, 2),
+        'tracking': tracking,
         'regions': regions[:12],
         'total_regions': len(regions),
     }
@@ -817,7 +952,15 @@ def _f_blocks(ctx: FilterContext, params: dict[str, str]) -> None:
 # Pipeline execution & compact bounded formatting
 # ============================================================================
 
-def run_pipeline(image_path: str | Path, vf: str = 'theme,layout,controls,text_bands,ui_map=48:20') -> FilterContext:
+def run_pipeline(
+    image_path: str | Path,
+    vf: str = 'theme,layout,controls,text_bands,ui_map=48:20',
+    *,
+    ocr_provider: Callable[..., dict[str, Any]] | None = None,
+    vlm_policy: fvlm.VLMProbePolicy | None = None,
+    vlm_backend: Callable[..., str] | None = None,
+    prev_track_map: dict[str, str] | None = None,
+) -> FilterContext:
     """Execute an ffmpeg-style filter graph over a screenshot (read-only)."""
     steps = parse_vf(vf)
     rgb, sha, name = _load_screen_rgb(image_path)
@@ -828,6 +971,10 @@ def run_pipeline(image_path: str | Path, vf: str = 'theme,layout,controls,text_b
         full_w=int(rgb.shape[1]),
         full_h=int(rgb.shape[0]),
         rgb=rgb,
+        ocr_provider=ocr_provider,
+        vlm_policy=vlm_policy or fvlm.DEFAULT_POLICY,
+        vlm_backend=vlm_backend,
+        prev_track_map=prev_track_map,
     )
     for fname, params in steps:
         t0 = time.perf_counter()
@@ -837,13 +984,99 @@ def run_pipeline(image_path: str | Path, vf: str = 'theme,layout,controls,text_b
     return ctx
 
 
+def to_canonical_dict(ctx: FilterContext) -> dict[str, Any]:
+    """Canonical structured screen model; compact text reports are views over this object."""
+    return {
+        'schema': SCHEMA_SCREEN,
+        'source_name': ctx.source_name,
+        'source_sha256': ctx.source_sha256,
+        'source_frame': ctx.source_frame_id,
+        'full_size': [ctx.full_w, ctx.full_h],
+        'scope': ctx.global_bbox,
+        'trace': ctx.trace,
+        'artifacts': ctx.artifacts,
+    }
+
+
+def query_canonical(ctx: FilterContext, selector: str) -> str:
+    """Bounded targeted query over canonical artifacts (e.g. 'P0', 'W1', 'K0', 'ambiguities', 'ocr', 'ui_diff')."""
+    sel = selector.strip()
+    if sel.upper().startswith('P') and sel[1:].isdigit():
+        panels = ctx.artifacts.get('layout', {}).get('panels', [])
+        p = next((x for x in panels if x['id'] == sel.upper()), None)
+        if not p:
+            raise FilterDeny(f'panel {sel!r} not found')
+        ctls = [c for c in ctx.artifacts.get('controls', {}).get('controls', []) if c.get('inside_panel') == p['id']]
+        lines = [
+            f'PANEL {p["id"]} ({p["position_hint"]}) bbox={p["global_bbox"]} bg={p["bg_hex"]}({p["bg_family"]}) L={p["luma"]} area={p["area_pct"]}%',
+            f'Controls inside {p["id"]} ({len(ctls)}):',
+        ]
+        for c in ctls:
+            lines.append('  ' + _format_control_line(c))
+        return '\n'.join(lines)
+
+    if sel.upper().startswith('W') and sel[1:].isdigit():
+        ctls = ctx.artifacts.get('controls', {}).get('controls', [])
+        c = next((x for x in ctls if x['id'] == sel.upper()), None)
+        if not c:
+            raise FilterDeny(f'control {sel!r} not found')
+        out = [_format_control_line(c)]
+        if c.get('association_candidates'):
+            out.append('AMBIGUITY CANDIDATES:')
+            for a in c['association_candidates']:
+                out.append(f'  ocr={a["ocr_id"]} text={a["text"]!r} reason={a["reason"]} cands={a["candidates"]}')
+        return '\n'.join(out)
+
+    if sel.upper().startswith('K') and sel[1:].isdigit():
+        tr = ctx.artifacts.get('ui_diff', {}).get('tracking', {}).get('tracks', [])
+        e = next((x for x in tr if x['track'] == sel.upper()), None)
+        if not e:
+            raise FilterDeny(f'track {sel!r} not found (run ui_diff first)')
+        return json.dumps(e, indent=2, ensure_ascii=False)
+
+    if sel.lower() == 'ambiguities':
+        lines = []
+        tca = ctx.artifacts.get('text_control_association', {})
+        for a in tca.get('ambiguities', []):
+            lines.append(f'OCR_ASSOC_AMBIGUOUS {a["ocr_id"]} text={a["text"]!r} reason={a["reason"]} cands={a["candidates"]}')
+        for e in ctx.artifacts.get('ui_diff', {}).get('tracking', {}).get('tracks', []):
+            if e['classification'] == fdiff.CLS_AMBIGUOUS:
+                lines.append(
+                    f'TRACK_AMBIGUOUS {e["track"]} a={e["frame_a_local"]} b={e["frame_b_local"]} '
+                    f'competing={e.get("competing_candidates")}'
+                )
+        return '\n'.join(lines) if lines else 'NO AMBIGUITIES RECORDED'
+
+    if sel.lower() in ctx.artifacts:
+        return json.dumps(ctx.artifacts[sel.lower()], indent=2, ensure_ascii=False)[:6000]
+    raise FilterDeny(f'unknown selector {selector!r}; use P<n>, W<n>, K<n>, ambiguities, or artifact key')
+
+
+def _format_control_line(c: dict[str, Any]) -> str:
+    txt_part = ''
+    assoc = c.get('association')
+    if assoc:
+        if c.get('text') is not None:
+            conf_s = f'(conf={c["text_confidence"]})' if c.get('text_confidence') is not None else ''
+            txt_part = f' text={c["text"]!r} text_source={c["text_source"]}{conf_s} association={assoc}'
+        else:
+            txt_part = f' text=None text_source={c.get("text_source")} association={assoc}({c.get("association_reason")})'
+    else:
+        lbl = 'has_inner_text/icon' if c.get('has_inner_contrast') else 'flat'
+        txt_part = f' [{lbl}]'
+    return (
+        f'{c["id"]:<3s} type={c["kind"]:<16s} bbox={c["global_bbox"]} click={tuple(c["click_center"])} '
+        f'color={c["hex"]}({c["family"]}) panel={c["inside_panel"]}{txt_part}'
+    )
+
+
 def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
     total_ms = round(sum(t['ms'] for t in ctx.trace), 2)
     chain = ' -> '.join(f'{t["filter"]}({t["ms"]}ms)' for t in ctx.trace)
     out = [
         f'FLOWSIGHT SCREEN v1 | {ctx.source_name} ({ctx.full_w}x{ctx.full_h}) | scope={ctx.global_bbox} | SHA256={ctx.source_sha256[:16]}',
         f'PIPELINE ({total_ms}ms): {chain}',
-        'Coordinates: origin top-left (0,0); x right, y down; bboxes [x0,y0,x1,y1) EXCLUSIVE; click=(cx,cy).',
+        'Coordinates: origin top-left (0,0); x right, y down; bboxes [x0,y0,x1,y1) EXCLUSIVE; click=(cx,cy). Local W-IDs are per-frame only.',
     ]
 
     if 'theme' in ctx.artifacts:
@@ -871,13 +1104,17 @@ def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
 
     if 'controls' in ctx.artifacts:
         ct = ctx.artifacts['controls']
-        out.append(f'CONTROLS (DEMONSTRATED clickable candidates, total={ct["total_detected"]}):')
+        out.append(f'CONTROLS (DEMONSTRATED geometric candidates — appearance != verified interactivity, total={ct["total_detected"]}):')
         for c in ct['controls']:
-            lbl = 'has_inner_text/icon' if c['has_inner_contrast'] else 'flat'
-            out.append(
-                f'  {c["id"]:<3s} {c["kind"]:<16s} bbox={c["global_bbox"]} click={tuple(c["click_center"])} '
-                f'color={c["hex"]}({c["family"]}) panel={c["inside_panel"]} [{lbl}]'
-            )
+            out.append('  ' + _format_control_line(c))
+
+    if 'text_control_association' in ctx.artifacts:
+        tca = ctx.artifacts['text_control_association']
+        if tca['ambiguities']:
+            out.append(f'AMBIGUOUS TEXT-CONTROL ASSOCIATIONS ({len(tca["ambiguities"])}, NO arbitrary winner chosen):')
+            for a in tca['ambiguities'][:6]:
+                c_str = ', '.join(f'{cand["control_id"]}({cand.get("relation","overlap")})' for cand in a['candidates'][:3])
+                out.append(f'  {a["ocr_id"]} text={a["text"]!r} bbox={a["bbox"]} reason={a["reason"]} candidates=[{c_str}]')
 
     if 'text_bands' in ctx.artifacts:
         tb = ctx.artifacts['text_bands']
@@ -895,12 +1132,16 @@ def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
 
     if 'ocr' in ctx.artifacts:
         oc = ctx.artifacts['ocr']
-        if oc['status'] != 'OK':
-            out.append(f'OCR: status={oc["status"]} ({oc["detail"]})')
+        st = oc['status']
+        if st in (focr.OCR_ABSENT, focr.OCR_ERROR):
+            out.append(f'OCR: status={st} engine={oc.get("engine")} ({oc["detail"]})')
         else:
-            out.append(f'OCR (backend={oc["backend"]}, lang={oc["lang"]}, lines={len(oc["lines"])}):')
-            for ln in oc['lines'][:25]:
-                out.append(f'  bbox={ln["global_bbox"]} conf={ln["conf"]} text={ln["text"]!r}')
+            out.append(
+                f'OCR: status={st} engine={oc.get("engine")} lang={oc.get("lang")} '
+                f'scale={oc.get("confidence_scale")} items={len(oc.get("items", []))} ({oc.get("elapsed_ms")}ms):'
+            )
+            for ln in oc.get('items', [])[:25]:
+                out.append(f'  {ln["id"]:<3s} [{ln["status"]}] bbox={ln["bbox"]} conf={ln["confidence"]} text={ln["text"]!r}')
 
     if 'ui_map' in ctx.artifacts:
         um = ctx.artifacts['ui_map']
@@ -910,15 +1151,65 @@ def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
 
     if 'ui_diff' in ctx.artifacts:
         df = ctx.artifacts['ui_diff']
+        tr = df['tracking']
         out.append(
-            f'UI DIFF vs {df["reference_name"]}: changed={df["changed_pixels"]}px ({df["changed_pct"]}%) '
-            f'regions={len(df["regions"])}/{df["total_regions"]}:'
+            f'UI DIFF (IDENTITY-BASED) frame_a={df["frame_a"]["source_name"]}({df["frame_a"]["source_sha256"][:8]}) '
+            f'-> frame_b={df["frame_b"]["source_name"]}({df["frame_b"]["source_sha256"][:8]}) | '
+            f'changed_px={df["changed_pixels"]} ({df["changed_pct"]}%) | tracks={tr["summary_counts"]}'
         )
+        out.append('TRACKED CONTROLS (persistent track=K<n> separate from per-frame local W<n>):')
+        for e in tr['tracks']:
+            inf = f' INFERRED={e["inferred_flags"]}' if e.get('inferred_flags') else ''
+            flags_s = '+'.join(e['flags'])
+            if e['classification'] == fdiff.CLS_NEW:
+                fb_c = e['frame_b']
+                txt = f' text={fb_c["text"]!r}' if fb_c.get('text') else ''
+                out.append(
+                    f'  track={e["track"]:<3s} local_b={e["frame_b_local"]:<3s} {flags_s} '
+                    f'bbox={fb_c["bbox"]} color={fb_c["hex"]}({fb_c["family"]}) panel={fb_c["panel"]}{txt}'
+                )
+            elif e['classification'] == fdiff.CLS_REMOVED:
+                fa_c = e['frame_a']
+                txt = f' text={fa_c["text"]!r}' if fa_c.get('text') else ''
+                out.append(
+                    f'  track={e["track"]:<3s} local_a={e["frame_a_local"]:<3s} {flags_s} '
+                    f'bbox={fa_c["bbox"]} color={fa_c["hex"]}({fa_c["family"]}) panel={fa_c["panel"]}{txt}'
+                )
+            elif e['classification'] == fdiff.CLS_AMBIGUOUS:
+                out.append(
+                    f'  track={e["track"]:<3s} local_a={e["frame_a_local"]} local_b={e["frame_b_local"]} '
+                    f'AMBIGUOUS_MATCH score={e["affinity"]["score"]} competing={e["competing_candidates"]}'
+                )
+            else:
+                extra = []
+                if e.get('color_transition'):
+                    extra.append(f'color={e["color_transition"]}')
+                if e.get('text_transition'):
+                    extra.append(f'text={e["text_transition"]}')
+                if fdiff.CLS_MOVED in e['flags']:
+                    extra.append(f'delta_center={tuple(e["delta_center_px"])}')
+                if e['frame_b'].get('text'):
+                    extra.append(f'text={e["frame_b"]["text"]!r}')
+                ex_s = (' ' + ' '.join(extra)) if extra else ''
+                out.append(
+                    f'  track={e["track"]:<3s} local_a={e["frame_a_local"]:<3s}->local_b={e["frame_b_local"]:<3s} '
+                    f'{flags_s} bbox={e["frame_b"]["bbox"]}{ex_s}{inf}'
+                )
+        out.append(f'PIXEL DIFF REGIONS ({len(df["regions"])}/{df["total_regions"]}):')
         for r in df['regions']:
             out.append(
                 f'  {r["id"]:<3s} bbox={r["global_bbox"]} px={r["changed_pixels"]} '
-                f'{r["old_hex"]}->{r["new_hex"]} panel={r["inside_panel"]} controls={r["overlapping_controls"]}'
+                f'{r["old_hex"]}({r["old_family"]})->{r["new_hex"]}({r["new_family"]}) '
+                f'panel={r["inside_panel"]} tracks={r["overlapping_tracks"]}'
             )
+
+    if 'vlm_probe' in ctx.artifacts:
+        vp = ctx.artifacts['vlm_probe']
+        out.append(
+            f'VLM_PROBE [{vp["status"]}] provenance={vp["provenance"]} bbox={vp["global_bbox"]}: {vp["detail"]}'
+        )
+        if vp.get('description'):
+            out.append(f'  VLM_INFERRED_TEXT: {vp["description"]}')
 
     if 'blocks' in ctx.artifacts:
         bk = ctx.artifacts['blocks']
@@ -940,7 +1231,13 @@ def format_filter_catalog() -> str:
     lines = ['FLOWSIGHT SCREEN FILTERS (ffmpeg-style -vf "f1=...,f2,..."):']
     for name in sorted(FILTERS):
         sp = FILTERS[name]
-        lines.append(f'  {sp.name:<12s} | {sp.syntax:<46s} | {sp.summary}')
+        net = 'net' if sp.requires_network else 'local'
+        gpu = 'gpu' if sp.requires_gpu else 'cpu'
+        det = 'det' if sp.deterministic else 'nondet'
+        deps = ','.join(sp.optional_deps) if sp.optional_deps else 'none'
+        lines.append(
+            f'  {sp.name:<12s} | {sp.syntax:<44s} | [{net}/{gpu}/{det} deps={deps} {sp.coord_space}] {sp.summary}'
+        )
     return '\n'.join(lines)
 
 
