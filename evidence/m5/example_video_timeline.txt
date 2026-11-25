@@ -1,0 +1,13 @@
+FLOWSIGHT TIMELINE v1 | source=demo_timeline.mp4 | sampled=8 keyframes=4 skipped_static=4 | events=11 (1029.31ms)
+Provenance: DEMONSTRATED frame geometry/color/OCR transitions; STATE_CHANGED_CANDIDATE is INFERRED.
+  t=1.00s (f10) [CONTROL_TEXT_CHANGED] track=K1 bbox=[258, 220, 682, 262] transition='Target Branch'->'TargetBranch'
+  t=1.00s (f10) [CONTROL_COLOR_CHANGED] track=K2 bbox=[260, 520, 510, 568] transition=#14a249(green)->#e89417(orange) text='Merge pull request' INFERRED=['STATE_CHANGED_CANDIDATE']
+  t=1.00s (f10) [TEXT_APPEARED] bbox=[258, 193, 390, 215] text='TargetBranch'
+  t=1.00s (f10) [TEXT_DISAPPEARED] bbox=[258, 193, 390, 215] text='Target Branch'
+  t=2.00s (f20) [CONTROL_RESIZED] track=K0 bbox=[342, 122, 678, 156]
+  t=2.00s (f20) [CONTROL_RESIZED] track=K1 bbox=[263, 225, 677, 257]
+  t=2.00s (f20) [CONTROL_APPEARED] track=K5 bbox=[700, 100, 1160, 290] color=#311720(dark-magenta)
+  t=2.00s (f20) [CONTROL_APPEARED] track=K6 bbox=[958, 222, 1132, 270] color=#d644ec(violet) text='Dismiss'
+  t=2.00s (f20) [TEXT_APPEARED] bbox=[1004, 234, 1087, 259] text='Dismiss'
+  t=3.00s (f30) [CONTROL_APPEARED] track=K7 bbox=[260, 320, 681, 386] color=#b61b19(red) text='ERR0R:exit=56'
+  t=3.00s (f30) [TEXT_APPEARED] bbox=[284, 341, 490, 368] text='ERR0R:exit=56'

@@ -2,7 +2,7 @@
 
 > **Importante:** Este documento NO ha sido aplicado al hub global. Registrar o reiniciar `isymcp-hub.service` desconecta momentáneamente las sesiones TUI activas; hazlo solo cuando quieras activarlo.
 
-## Tools expuestas por `flowsight_mcp.py` (10 tools, solo lectura sobre imágenes)
+## Tools expuestas por `flowsight_mcp.py` (14 tools, solo lectura sobre imágenes/videos)
 
 1. `flowsight_map_blocks` — partición `1920×1080` en mitades/cuartos con paleta global y error medido.
 2. `flowsight_get_block` — inspección compacta de un bloque (color + bordes Sobel + regiones).
@@ -14,6 +14,10 @@
 8. `flowsight_screen_query` — consulta acotada por selector (`P0`, `W1`, `K0`, `ambiguities`, `ocr`, `ui_diff`, `vlm_probe`).
 9. `flowsight_log_failure` — registra un fallo confirmado por el usuario (vía `ask_user`) en el corpus privado local de **esta PC** (`~/.local/share/flowsight/private_failures/`, `0700`/`0600`, fuera de git).
 10. `flowsight_list_failures` — inspecciona fallos guardados localmente en esta PC para depuración.
+11. `flowsight_index_add` — indexa explícitamente capturas en el índice local efímero SQLite+FTS5 (`ttl_hours`, `0700`/`0600`, sin guardar píxeles).
+12. `flowsight_index_search` — búsqueda visual progresiva top-K (BM25 + filtros `theme`/`color`/`since`/`until`) con evidencia OCR, `bbox` exacto y sugerencia de `crop`.
+13. `flowsight_index_purge` — expiración o purga explícita (`expired`, `all`, `sha256`, `path_prefix`).
+14. `flowsight_timeline_scan` — percepción temporal sobre videos (`.mp4/.mkv/.webm`) o secuencias ordenadas de capturas con salto de frames estáticos y eventos con timestamp.
 
 ## Activación opt-in de `vlm_probe` en MCP (apagado por defecto)
 

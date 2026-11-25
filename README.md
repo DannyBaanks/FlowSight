@@ -31,6 +31,14 @@ python3 flowsight_screen.py -i screen.png \
 # Corpus privado local de fallos (único por PC, fuera de git: ~/.local/share/flowsight/private_failures/)
 python3 flowsight_corpus.py list
 python3 flowsight_corpus.py stats
+
+# M5-A: Búsqueda visual progresiva (SQLite + FTS5 + TTL, sin guardar píxeles)
+python3 flowsight_index.py add ./capturas/ --ttl-hours 24
+python3 flowsight_index.py search "UFW 3128" --theme dark --limit 3
+python3 flowsight_index.py purge --mode expired
+
+# M5-B: Timeline temporal sobre video (.mp4/.mkv/.webm) o secuencia de capturas
+python3 flowsight_timeline.py demo.mp4 --fps 2 --query "exit=56"
 ```
 
 Registro manual y reversible en `isymcp-hub` (sin modificar el daemon automáticamente): ver [`docs/MCP_REGISTRATION.md`](docs/MCP_REGISTRATION.md).
@@ -138,10 +146,12 @@ python3 flowsight.py export-flowpaint sprite.sqlite sprite.flowpaint
 - [`evidence/m2_blocks/`](evidence/m2_blocks/) — Artefactos 1920×1080, salidas de bloques/stitch y transcript real con NVIDIA NIM (`nemotron-3.5-lightning-30b-a3b`).
 - [`evidence/m3_screen/`](evidence/m3_screen/) — Capturas UI 1920×1080, reportes `-vf`, `ui_diff` y transcript ciego con NVIDIA NIM.
 - [`evidence/m4/`](evidence/m4/) — Corpus adversarial de 13 casos con `ground_truth.json`, `benchmark_m4.json`, ejemplos OCR/`ui_diff` y transcript ciego M4 con NVIDIA NIM.
+- [`evidence/m5/`](evidence/m5/) — Benchmark de 7 capturas (`90.71%` de ahorro de contexto), `demo_timeline.mp4`, ejemplos de búsqueda progresiva/zoom/timeline y `SHA256SUMS_M5.txt`.
 - [`reports/GATES_M1.md`](reports/GATES_M1.md) — Matriz consolidada M1 (`DEMONSTRATED`, `INFERRED`, `NOT_DEMONSTRATED`).
 - [`reports/GATES_M2.md`](reports/GATES_M2.md) — Matriz consolidada M2 (bloques 1920×1080, stitching, MCP stdio E2E y experimento NVIDIA NIM).
 - [`reports/GATES_M3.md`](reports/GATES_M3.md) — Matriz consolidada M3 (motor de filtros estilo `ffmpeg` para capturas de pantalla).
-- [`reports/GATES_M4.md`](reports/GATES_M4.md) — Matriz consolidada M4 (OCR + asociación texto-control, `ui_diff` por identidad temporal, contrato `vlm_probe` y experimento ciego Q1..Q6).
+- [`reports/GATES_M4.md`](reports/GATES_M4.md) — Matriz consolidada M4 (OCR real + asociación texto-control, `ui_diff` por identidad temporal, contrato `vlm_probe` y experimento ciego Q1..Q6).
+- [`reports/GATES_M5.md`](reports/GATES_M5.md) — Matriz consolidada M5 (índice visual progresivo SQLite+FTS5+TTL y timeline temporal sobre video/secuencias).
 
 ## Licencia
 

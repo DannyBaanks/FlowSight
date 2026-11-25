@@ -1,0 +1,36 @@
+{
+  "seven_screenshots_progressive_search": {
+    "screenshots": 7,
+    "naive_7_full_reports_chars": 21931,
+    "progressive_search_chars": 912,
+    "winning_crop_zoom_chars": 1125,
+    "progressive_total_chars": 2037,
+    "char_savings_pct": 90.71,
+    "index_cold_ms": 3439.34,
+    "index_cached_dedup_ms": 1.9,
+    "db_bytes": 4096,
+    "top1_source": "shot_03_ufw_terminal.png",
+    "top1_score": 0.9,
+    "top1_crop_vf": "crop=0:0:854:270",
+    "top1_matched_terms": [
+      "3128",
+      "ufw"
+    ]
+  },
+  "video_timeline_mp4": {
+    "video": "demo_timeline.mp4",
+    "total_sampled_frames": 8,
+    "keyframes_analyzed": 4,
+    "frames_skipped_static": 4,
+    "events_total": 11,
+    "elapsed_ms": 1029.31,
+    "event_types": [
+      "CONTROL_APPEARED",
+      "CONTROL_COLOR_CHANGED",
+      "CONTROL_RESIZED",
+      "CONTROL_TEXT_CHANGED",
+      "TEXT_APPEARED",
+      "TEXT_DISAPPEARED"
+    ]
+  }
+}

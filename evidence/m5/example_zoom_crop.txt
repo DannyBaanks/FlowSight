@@ -1,0 +1,11 @@
+FLOWSIGHT SCREEN v1 | shot_03_ufw_terminal.png (1280x720) | scope=[0, 0, 854, 270] | SHA256=a083e587da6bb9fb
+PIPELINE (1312.51ms): crop(0.11ms) -> controls(1.27ms) -> ocr(1311.13ms)
+Coordinates: origin top-left (0,0); x right, y down; bboxes [x0,y0,x1,y1) EXCLUSIVE; click=(cx,cy). Local W-IDs are per-frame only.
+CONTROLS (DEMONSTRATED geometric candidates — appearance != verified interactivity, total=0):
+OCR: status=OCR_OBSERVED engine=rapidocr-onnxruntime installed (PP-OCRv4 ONNX) lang=eng scale=rapidocr_0_100_uncalibrated (raw 0..1 x100; NOT calibrated probability) items=6 (1310.89ms):
+  O0  [OCR_OBSERVED] bbox=[28, 18, 424, 38] conf=98.9 text='Terminal-UFwFirewallStatus'
+  O1  [OCR_OBSERVED] bbox=[71, 98, 376, 117] conf=99.7 text='sudoufwstatusnumbered'
+  O2  [OCR_OBSERVED] bbox=[48, 135, 273, 157] conf=96.5 text='Regla anadida(v6)'
+  O3  [OCR_OBSERVED] bbox=[47, 172, 748, 197] conf=97.7 text='3128/tcp on br-575398bb8361 ALL0w # artex-lab nim proxy'
+  O4  [OCR_OBSERVED] bbox=[744, 173, 815, 196] conf=83.8 text='（E4N)'
+  O5  [OCR_OBSERVED] bbox=[46, 211, 392, 235] conf=95.9 text='Status: activeonport 3128'

@@ -30,18 +30,22 @@ from mcp.server.mcpserver import MCPServer
 import flowsight as fs
 import flowsight_blocks as fb
 import flowsight_corpus as fcorp
+import flowsight_index as fidx
 import flowsight_screen as fscr
+import flowsight_timeline as ftl
 import flowsight_vlm as fvlm
 
 mcp = MCPServer(
     'flowsight',
     instructions=(
         'FlowSight gives text-only agents structured, bounded spatial perception over screenshots, '
-        'images, and FLOW programs without giant per-pixel JSON. '
-        'For desktop/mobile/web screenshots (ffmpeg-style composable filters): call '
-        'flowsight_screen_filters() to discover filters, then flowsight_screen_run(image_path, vf=...) '
-        'e.g. vf="theme,layout,controls,text_bands,ocr,ui_map=48:20" or crop=x:y:w:h to zoom into a panel '
-        '(with optional crop-only vlm_probe when enabled by the user). '
+        'images, videos, and FLOW programs without giant per-pixel JSON. '
+        'When inspecting MULTIPLE screenshots (e.g. 5-50 files), prefer PROGRESSIVE SEARCH to save context: '
+        'call flowsight_index_add(paths) -> flowsight_index_search(query, theme, color) -> then deepen ONLY '
+        'the winning candidate crop via flowsight_screen_run(image_path, vf="crop=...,controls,ocr"). '
+        'For videos (.mp4/.mkv/.webm) or ordered screenshot sequences, call flowsight_timeline_scan(inputs) '
+        'to detect when modals, state/color changes, or error texts appeared. '
+        'For single screenshots: flowsight_screen_filters() / flowsight_screen_run() / flowsight_screen_query(). '
         'For high-res split/stitch analysis: flowsight_map_blocks -> flowsight_get_block -> flowsight_stitch_blocks. '
         'For FLOW programs: flowsight_inspect_lossless(mode="flow"). '
         'Always distinguish DEMONSTRATED measurements from INFERRED hypotheses. '
@@ -321,6 +325,130 @@ def flowsight_list_failures(
 ) -> str:
     rows = fcorp.list_failures(limit=limit, category=category or None)
     return fcorp.format_failure_list(rows)
+
+
+@mcp.tool(
+    description=(
+        'Explicitly index one or more screenshot paths (or a single non-recursive directory) into '
+        'the local ephemeral SQLite+FTS5 progressive visual index (~/.local/share/flowsight/, 0700/0600, '
+        'NO image pixels stored, SHA-256 deduplicated, expires automatically after ttl_hours). '
+        'Follow with flowsight_index_search to avoid dumping many full screenshot reports into context.'
+    ),
+)
+def flowsight_index_add(
+    paths: list[str],
+    use_ocr: bool = True,
+    ttl_hours: float = 24.0,
+    max_files: int = 64,
+) -> str:
+    try:
+        res = fidx.index_paths(paths, use_ocr=use_ocr, ttl_hours=ttl_hours, max_files=max_files)
+        lines = [
+            f'INDEXED new={res["indexed_new"]} cached={res["reused_cached"]} '
+            f'total_in={res["total_input_files"]} errors={len(res["errors"])} '
+            f'({res["elapsed_ms"]}ms, db={res["db_bytes"]}B, expires={res["expires_utc"]})',
+            f'db={res["db_path"]}',
+        ]
+        for e in res['entries'][:20]:
+            tag = 'CACHED' if e['cached'] else 'NEW'
+            lines.append(
+                f'  [{tag}] {e["source_name"]} sha={e["sha256"]} theme={e["theme"]} '
+                f'ocr={e["ocr_status"]}({e["ocr_items"]}) controls={e["controls"]}'
+            )
+        for err in res['errors'][:5]:
+            lines.append(f'  [ERR] {err["path"]}: {err["error"]}')
+        return '\n'.join(lines)
+    except (ValueError, OSError) as e:
+        return f'DENY {e}'
+
+
+@mcp.tool(
+    description=(
+        'Progressive visual search over explicitly indexed screenshots (BM25 FTS5 + exact token match + '
+        'theme/color/time filters). Returns compact ranked candidates with matched OCR fragments, exact '
+        'global bboxes [x0,y0,x1,y1), and ready-to-run padded `crop=x:y:w:h` hints for deepening.'
+    ),
+)
+def flowsight_index_search(
+    query: str = '',
+    theme: str = '',
+    color: str = '',
+    since: str = '',
+    until: str = '',
+    limit: int = 5,
+) -> str:
+    try:
+        res = fidx.search_index(
+            query,
+            theme=theme,
+            color=color,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+        return fidx.format_search_report(res)
+    except (ValueError, OSError) as e:
+        return f'DENY {e}'
+
+
+@mcp.tool(
+    description=(
+        'Explicit lifecycle management for the local progressive visual index: purge expired entries '
+        '(mode="expired"), purge everything (mode="all"), or remove by sha256 prefix / path_prefix.'
+    ),
+)
+def flowsight_index_purge(
+    mode: Literal['expired', 'all', 'sha256', 'path_prefix'] = 'expired',
+    sha256: str = '',
+    path_prefix: str = '',
+) -> str:
+    try:
+        res = fidx.purge_index(mode=mode, sha256=sha256, path_prefix=path_prefix)
+        return (
+            f'PURGED mode={res["mode"]} removed={res["removed"]} remaining={res["remaining"]} '
+            f'db={res["db_path"]}'
+        )
+    except (ValueError, OSError) as e:
+        return f'DENY {e}'
+
+
+@mcp.tool(
+    description=(
+        'Temporal UI perception over a video file (.mp4/.mkv/.webm/.avi) OR an ordered list of '
+        'screenshot paths. Skips near-identical static frames, tracks persistent controls (K0..Kn) '
+        'and OCR text across keyframes, and reports timestamped events (CONTROL_APPEARED, '
+        'CONTROL_COLOR_CHANGED + INFERRED STATE_CHANGED_CANDIDATE, TEXT_APPEARED, etc.).'
+    ),
+)
+def flowsight_timeline_scan(
+    inputs: list[str],
+    sample_fps: float = 2.0,
+    max_frames: int = 40,
+    scene_thresh: float = 6.0,
+    use_ocr: bool = True,
+    query: str = '',
+) -> str:
+    try:
+        if not inputs:
+            return 'DENY inputs must contain a video path or >=2 image paths'
+        first = Path(inputs[0]).expanduser()
+        if len(inputs) == 1 and first.suffix.lower() in ftl.VIDEO_EXTS:
+            res = ftl.scan_video(
+                first,
+                sample_fps=sample_fps,
+                max_frames=max_frames,
+                scene_thresh=scene_thresh,
+                use_ocr=use_ocr,
+            )
+        else:
+            res = ftl.scan_sequence(
+                inputs,
+                scene_thresh=scene_thresh,
+                use_ocr=use_ocr,
+            )
+        return ftl.format_timeline_report(res, query=query)
+    except (ValueError, OSError, fscr.FilterDeny) as e:
+        return f'DENY {e}'
 
 
 if __name__ == '__main__':

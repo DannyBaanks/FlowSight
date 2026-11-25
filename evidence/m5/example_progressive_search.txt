@@ -1,0 +1,9 @@
+FLOWSIGHT PROGRESSIVE SEARCH v1 | query='UFW 3128' | terms=['ufw', '3128'] | matches=1/7 (0.89ms)
+Provenance: DEMONSTRATED OCR/geometry index hits (bbox=[x0,y0,x1,y1) EXCLUSIVE). Deepen ONLY winning crop(s).
+#1 score=0.900 cov=1.00 | shot_03_ufw_terminal.png (1280x720, theme=dark, sha=a083e587da6bb9fb, mtime=2026-11-25T02:19:29Z)
+   path=/home/danny/Development/ISyCo Git/FlowSight/evidence/m5/seven_shots/shot_03_ufw_terminal.png
+   deepen_vf="crop=0:0:854:270,controls,ocr" (union_bbox=[0, 0, 854, 270])
+   - O0 [OCR_OBSERVED] bbox=[26, 15, 427, 41] conf=95.5 text='Terminal - UFw Firewall Status'
+   - O1 [OCR_OBSERVED] bbox=[46, 96, 380, 121] conf=95.2 text='$ sudo ufw status numbered'
+   - O3 [OCR_OBSERVED] bbox=[46, 172, 818, 198] conf=97.4 text='3128/tcp on br-575398bb8361 ALL0W # artex-lab nim proxy (E4N)'
+   - O4 [OCR_OBSERVED] bbox=[46, 211, 393, 234] conf=93.3 text='Status: active on port 3128'
