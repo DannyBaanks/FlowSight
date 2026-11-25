@@ -2,7 +2,7 @@
 
 > **Importante:** Este documento NO ha sido aplicado al hub global. Registrar o reiniciar `isymcp-hub.service` desconecta momentáneamente las sesiones TUI activas; hazlo solo cuando quieras activarlo.
 
-## Tools expuestas por `flowsight_mcp.py` (8 tools, solo lectura sobre imágenes)
+## Tools expuestas por `flowsight_mcp.py` (10 tools, solo lectura sobre imágenes)
 
 1. `flowsight_map_blocks` — partición `1920×1080` en mitades/cuartos con paleta global y error medido.
 2. `flowsight_get_block` — inspección compacta de un bloque (color + bordes Sobel + regiones).
@@ -11,7 +11,17 @@
 5. `flowsight_inspect_lossless` — modo lossless M1 (`--mode flow` / `--mode visual`).
 6. `flowsight_screen_filters` — catálogo declarativo estilo `ffmpeg -filters`.
 7. `flowsight_screen_run` — pipeline `-vf` para capturas (`theme,layout,controls,text_bands,ocr,ui_map,ui_diff,vlm_probe`).
-8. `flowsight_screen_query` — consulta acotada por selector (`P0`, `W1`, `K0`, `ambiguities`, `ocr`, `ui_diff`).
+8. `flowsight_screen_query` — consulta acotada por selector (`P0`, `W1`, `K0`, `ambiguities`, `ocr`, `ui_diff`, `vlm_probe`).
+9. `flowsight_log_failure` — registra un fallo confirmado por el usuario (vía `ask_user`) en el corpus privado local de **esta PC** (`~/.local/share/flowsight/private_failures/`, `0700`/`0600`, fuera de git).
+10. `flowsight_list_failures` — inspecciona fallos guardados localmente en esta PC para depuración.
+
+## Activación opt-in de `vlm_probe` en MCP (apagado por defecto)
+
+Añade estas variables en el bloque `env` del servidor `flowsight` en `~/.config/isycode/mcp.json` (o en `servers.json`):
+- `FLOWSIGHT_VLM_ENABLED="1"`
+- `FLOWSIGHT_VLM_URL="http://127.0.0.1:11434/v1/chat/completions"` (loopback permitido por defecto; para endpoints remotos añade `FLOWSIGHT_VLM_ALLOW_REMOTE="1"`)
+- `FLOWSIGHT_VLM_MODEL="tu-modelo-vlm"`
+- `FLOWSIGHT_VLM_API_KEY="..."` *(opcional para endpoints locales; nunca se registra ni devuelve)*
 
 ## Paso 1 — Respaldo previo (reversible)
 

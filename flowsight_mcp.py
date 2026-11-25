@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """FlowSight MCP Server (mcp 2.x stdio) — Text-only visual peripheral.
 
-Exposes:
-  1. flowsight_map_blocks      — Split high-res images/photos (e.g. 1920x1080) into
-                                 halves or quarters with shared global palette & error metrics.
-  2. flowsight_get_block       — Inspect a single block (color map + Sobel edge map + regions).
-  3. flowsight_subdivide_block — Recursively split any block into sub-quarters/halves (quadtree zoom).
-  4. flowsight_stitch_blocks   — Structurally & semantically stitch blocks across real pixel seams,
-                                 merging cross-seam regions and aligning per-block agent notes.
-  5. flowsight_inspect_lossless — Query M1 lossless indices (--mode flow or --mode visual).
+Exposes 10 tools (read-only over user images; private local per-PC failure logging):
+  1.  flowsight_map_blocks      — Split high-res images/photos (e.g. 1920x1080) into
+                                  halves or quarters with shared global palette & error metrics.
+  2.  flowsight_get_block       — Inspect a single block (color map + Sobel edge map + regions).
+  3.  flowsight_subdivide_block — Recursively split any block into sub-quarters/halves (quadtree zoom).
+  4.  flowsight_stitch_blocks   — Structurally & semantically stitch blocks across real pixel seams,
+                                  merging cross-seam regions and aligning per-block agent notes.
+  5.  flowsight_inspect_lossless — Query M1 lossless indices (--mode flow or --mode visual).
+  6.  flowsight_screen_filters  — List ffmpeg-style screenshot filters & metadata.
+  7.  flowsight_screen_run      — Run composable -vf screenshot pipeline (layout, controls, OCR, ui_diff, opt-in vlm_probe).
+  8.  flowsight_screen_query    — Bounded selector query over canonical artifacts (P0, W1, K0, ambiguities, ocr, ui_diff).
+  9.  flowsight_log_failure     — Record a user-confirmed perception error into this PC's private local corpus.
+  10. flowsight_list_failures   — Inspect recent failure entries stored locally on this PC.
 
 Read-only over user images. Never modifies FLOW or FlowGen.
+Opt-in VLM escalation (`vlm_probe`) stays disabled unless FLOWSIGHT_VLM_ENABLED=1 is set in env.
 """
 from __future__ import annotations
 
@@ -23,7 +29,9 @@ from mcp.server.mcpserver import MCPServer
 
 import flowsight as fs
 import flowsight_blocks as fb
+import flowsight_corpus as fcorp
 import flowsight_screen as fscr
+import flowsight_vlm as fvlm
 
 mcp = MCPServer(
     'flowsight',
@@ -32,10 +40,14 @@ mcp = MCPServer(
         'images, and FLOW programs without giant per-pixel JSON. '
         'For desktop/mobile/web screenshots (ffmpeg-style composable filters): call '
         'flowsight_screen_filters() to discover filters, then flowsight_screen_run(image_path, vf=...) '
-        'e.g. vf="theme,layout,controls,text_bands,ui_map=48:20" or crop=x:y:w:h to zoom into a panel. '
+        'e.g. vf="theme,layout,controls,text_bands,ocr,ui_map=48:20" or crop=x:y:w:h to zoom into a panel '
+        '(with optional crop-only vlm_probe when enabled by the user). '
         'For high-res split/stitch analysis: flowsight_map_blocks -> flowsight_get_block -> flowsight_stitch_blocks. '
         'For FLOW programs: flowsight_inspect_lossless(mode="flow"). '
-        'Always distinguish DEMONSTRATED measurements from INFERRED semantic hypotheses.'
+        'Always distinguish DEMONSTRATED measurements from INFERRED hypotheses. '
+        'When assisting a user on a text-only model: explain what FlowSight observed, verify accuracy with '
+        'the user via ask_user, and if the user reports a FlowSight error (OCR, missed control, layout, diff), '
+        'log it locally on this PC via flowsight_log_failure for private debugging.'
     ),
 )
 
@@ -195,7 +207,7 @@ def flowsight_inspect_lossless(
 @mcp.tool(
     description=(
         'List all available ffmpeg-style screenshot filters and their `-vf` syntax '
-        '(crop, theme, layout, controls, text_bands, ocr, ui_map, ui_diff, blocks).'
+        '(crop, theme, layout, controls, text_bands, ocr, ui_map, ui_diff, vlm_probe, blocks).'
     ),
 )
 def flowsight_screen_filters() -> str:
@@ -205,19 +217,21 @@ def flowsight_screen_filters() -> str:
 @mcp.tool(
     description=(
         'Run an ffmpeg-style composable filter pipeline (`-vf`) specialized for desktop/web/app '
-        'screenshots (e.g. 1920x1080). Example vf: "theme,layout,controls,text_bands,ui_map=48:20" '
-        'or "crop=0:0:400:1080,controls,text_bands" or "layout,controls,ui_diff=/path/before.png". '
-        'Returns panels, clickable control centers (cx, cy), geometric text bands, wireframe map, '
+        'screenshots (e.g. 1920x1080). Example vf: "theme,layout,controls,text_bands,ocr,ui_map=48:20" '
+        'or "crop=0:0:400:400,vlm_probe=question=Describe icon" (requires FLOWSIGHT_VLM_ENABLED=1) '
+        'or "layout,controls,ocr,ui_diff=/path/before.png". '
+        'Returns panels, clickable control centers (cx, cy), OCR text + associations, wireframe map, '
         'and exact global coordinates.'
     ),
 )
 def flowsight_screen_run(
     image_path: str,
-    vf: str = 'theme,layout,controls,text_bands,ui_map=48:20',
+    vf: str = 'theme,layout,controls,text_bands,ocr,ui_map=48:20',
     max_chars: int = 6500,
 ) -> str:
     try:
-        ctx = fscr.run_pipeline(image_path, vf=vf)
+        vlm_policy, vlm_backend = fvlm.resolve_runtime_vlm_config()
+        ctx = fscr.run_pipeline(image_path, vf=vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
         return fscr.format_pipeline_report(ctx, max_chars=max(500, max_chars))
     except (fscr.FilterDeny, fb.BlocksDeny) as e:
         return f'DENY {e}'
@@ -227,7 +241,7 @@ def flowsight_screen_run(
     description=(
         'Bounded targeted query over a screenshot pipeline result without dumping full JSON. '
         'Selectors: "P0" (panel), "W1" (local control), "K0" (persistent diff track), '
-        '"ambiguities", "ocr", "controls", "layout", "ui_diff".'
+        '"ambiguities", "ocr", "controls", "layout", "ui_diff", "vlm_probe".'
     ),
 )
 def flowsight_screen_query(
@@ -236,10 +250,77 @@ def flowsight_screen_query(
     vf: str = 'theme,layout,controls,ocr',
 ) -> str:
     try:
-        ctx = fscr.run_pipeline(image_path, vf=vf)
+        vlm_policy, vlm_backend = fvlm.resolve_runtime_vlm_config()
+        ctx = fscr.run_pipeline(image_path, vf=vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
         return fscr.query_canonical(ctx, selector)
     except (fscr.FilterDeny, fb.BlocksDeny) as e:
         return f'DENY {e}'
+
+
+@mcp.tool(
+    description=(
+        'Log a user-confirmed FlowSight perception failure into THIS PC ONLY private local corpus '
+        '(~/.local/share/flowsight/private_failures/, mode 0700/0600, never synced or committed to git). '
+        'Use after confirming via ask_user what FlowSight missed or misread so developers can debug locally.'
+    ),
+)
+def flowsight_log_failure(
+    category: Literal[
+        'ocr_error',
+        'control_missed',
+        'control_false_positive',
+        'layout_error',
+        'diff_identity_error',
+        'vlm_probe_error',
+        'blind_misinterpretation',
+        'other',
+    ],
+    user_correction: str,
+    flowsight_observed: str = '',
+    agent_explanation: str = '',
+    expected_behavior: str = '',
+    image_path: str = '',
+    vf_pipeline: str = '',
+    provider: str = '',
+    model: str = '',
+    notes: str = '',
+    save_local_copy: bool = False,
+) -> str:
+    try:
+        res = fcorp.log_failure(
+            category=category,
+            user_correction=user_correction,
+            flowsight_observed=flowsight_observed,
+            agent_explanation=agent_explanation,
+            expected_behavior=expected_behavior,
+            image_path=image_path or None,
+            vf_pipeline=vf_pipeline,
+            provider=provider,
+            model=model,
+            notes=notes,
+            save_local_copy=save_local_copy,
+        )
+        return (
+            f'LOGGED {res["entry_id"]} [category={res["category"]}] machine={res["machine_id"]}\n'
+            f'corpus={res["corpus_path"]} img_sha={(res["source_image_sha256"] or "-")[:16]} '
+            f'local_copy={res["local_image_copy"] or "none"}'
+        )
+    except (ValueError, OSError) as e:
+        return f'DENY {e}'
+
+
+@mcp.tool(
+    description=(
+        'List recent entries from THIS PC private local failure corpus '
+        '(~/.local/share/flowsight/private_failures/) for local debugging.'
+    ),
+)
+def flowsight_list_failures(
+    limit: int = 20,
+    category: str = '',
+) -> str:
+    rows = fcorp.list_failures(limit=limit, category=category or None)
+    return fcorp.format_failure_list(rows)
 
 
 if __name__ == '__main__':

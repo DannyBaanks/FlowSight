@@ -714,7 +714,7 @@ def _f_ocr(ctx: FilterContext, params: dict[str, str]) -> None:
 )
 def _f_vlm_probe(ctx: FilterContext, params: dict[str, str]) -> None:
     question = params.get('question') or params.get('_0') or 'Describe the cropped UI element.'
-    model = params.get('model') or params.get('_1') or ''
+    model = params.get('model') or params.get('_1') or ctx.vlm_policy.default_model
     raw_bytes = ctx.rgb.tobytes()
     req = fvlm.VLMProbeRequest(
         source_sha256=ctx.source_sha256,
@@ -1251,6 +1251,11 @@ def main(argv=None) -> int:
     p.add_argument('--json', action='store_true', help='Emit structured JSON instead of compact text')
     p.add_argument('--max-chars', type=int, default=6500)
     p.add_argument('--filters', action='store_true', help='List available filters and exit')
+    p.add_argument('--enable-vlm', action='store_true', help='Opt-in enable crop-only vlm_probe (or set FLOWSIGHT_VLM_ENABLED=1)')
+    p.add_argument('--vlm-url', default=None, help='OpenAI-compatible VLM endpoint URL (or FLOWSIGHT_VLM_URL)')
+    p.add_argument('--vlm-model', default=None, help='VLM model name (or FLOWSIGHT_VLM_MODEL)')
+    p.add_argument('--vlm-allow-remote', action='store_true', help='Allow non-loopback VLM URL (or FLOWSIGHT_VLM_ALLOW_REMOTE=1)')
+    p.add_argument('--vlm-timeout', type=float, default=None, help='VLM HTTP timeout seconds (or FLOWSIGHT_VLM_TIMEOUT_S)')
     args = p.parse_args(argv)
 
     if args.filters:
@@ -1259,7 +1264,14 @@ def main(argv=None) -> int:
     if not args.input:
         p.error('missing -i/--input (or use --filters)')
     try:
-        ctx = run_pipeline(args.input, vf=args.vf)
+        vlm_policy, vlm_backend = fvlm.resolve_runtime_vlm_config(
+            enable=True if args.enable_vlm else None,
+            url=args.vlm_url,
+            model=args.vlm_model,
+            allow_remote=True if args.vlm_allow_remote else None,
+            timeout_s=args.vlm_timeout,
+        )
+        ctx = run_pipeline(args.input, vf=args.vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
         if args.json:
             payload = {
                 'schema': SCHEMA_SCREEN,

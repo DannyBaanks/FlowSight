@@ -22,6 +22,15 @@ python3 flowsight_screen.py -i screen.png -vf "theme,layout,controls,text_bands,
 
 # Diff basado en identidad temporal (tracks persistentes K0..Kn)
 python3 flowsight_screen.py -i after.png -vf "layout,controls,ocr,ui_diff=before.png"
+
+# Escalación VLM opt-in SOLO sobre recorte explícito (apagada por defecto)
+python3 flowsight_screen.py -i screen.png \
+  -vf "crop=250:510:270:68,vlm_probe=question=Describe el icono y estado visual" \
+  --enable-vlm --vlm-url http://127.0.0.1:11434/v1/chat/completions --vlm-model qwen2.5vl
+
+# Corpus privado local de fallos (único por PC, fuera de git: ~/.local/share/flowsight/private_failures/)
+python3 flowsight_corpus.py list
+python3 flowsight_corpus.py stats
 ```
 
 Registro manual y reversible en `isymcp-hub` (sin modificar el daemon automáticamente): ver [`docs/MCP_REGISTRATION.md`](docs/MCP_REGISTRATION.md).
