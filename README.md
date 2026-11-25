@@ -1,158 +1,148 @@
-# FlowSight — periférico de inspección espacial y estructural para agentes solo-texto
+# FlowSight — Percepción visual estructurada, componible y verificable para agentes solo-texto
 
-**M1 (repositorio independiente, periférico de solo lectura sobre `FLOW` y `FlowGen`).**
-`FlowSight` traduce imágenes PNG en una memoria espacial SQLite lossless y consultable por fóvea (L0 global acotado → L1 consultas regionales → L2 reconstrucción/verificación exacta), sin modificar los núcleos de `FLOW` ni `FlowGen` y sin usar modelos visuales ni APIs remotas.
+**«No dije que quisiera que fuera lo mismo. Quiero que funcione».**
 
-> La línea base **M0** y toda su evidencia original se conservan íntegras en [`evidence/m0/`](evidence/m0/) y en el commit inicial del repositorio.
+**FlowSight** es un periférico local, modular y de solo lectura (CLI + servidor MCP stdio con **14 tools**) que permite a modelos **100 % solo-texto** inspeccionar capturas de pantalla, secuencias temporales, videos de interfaces gráficas, imágenes de alta resolución (`1920×1080`) y programas visuales de [FLOW](https://github.com/DannyBaanks/FLOW) sin volcar JSONs gigantes por píxel y sin depender de visión multimodal nativa.
+
+> **Principio epistémico:** FlowSight **no** finge visión humana ni reemplaza medidas exactas con conjeturas. Toda salida separa explícitamente hechos medidos (`DEMONSTRATED`: geometría, coordenadas globales, colores, OCR observado, hashes) de hipótesis (`INFERRED`: p. ej. `STATE_CHANGED_CANDIDATE`, `VLM_INFERRED`) y límites (`NOT_DEMONSTRATED`). **Nunca ejecuta clics** y mantiene `FLOW` y `FlowGen` completamente intactos.
+
+```text
+capturas / video ─▶ filtros (-vf) ─▶ índice SQLite+FTS5 (TTL) ─▶ búsqueda (top-K + bbox) ─▶ crop exacto ─▶ respuesta
+```
 
 ---
 
-## Tres motores integrados: Screenshot Filters estilo `ffmpeg` (M3) + Bloques 1920×1080 (M2) + Lossless FLOW/Visual (M1)
+## Capacidades actuales (M0 → M5)
 
-### M3/M4. Motor de filtros componibles estilo `ffmpeg` para Capturas de Pantalla (`flowsight_screen.py`)
-Pipeline determinista `-vf "f1=...,f2,..."` (OpenCV + NumPy + SciPy + Pillow):
-- **10 filtros con metadata declarativa (`--filters`):** `crop`, `theme`, `layout`, `controls` (con `click=(cx,cy)`), `text_bands` (geométrico sin OCR), `ocr` (OCR local real CPU vía `tesseract` o `rapidocr-onnxruntime` PP-OCRv4 + asociación geométrica `TEXT_INSIDE`/`LABEL_ASSOCIATED`/`AMBIGUOUS_ASSOCIATION`/`NO_TEXT_EVIDENCE`, fail-closed `OCR_ABSENT`), `ui_map` (wireframe ASCII compacto), `ui_diff` (**basado en identidad temporal** con asignación global óptima, tracks persistentes `K0..Kn`, 9 clasificaciones y detección de `AMBIGUOUS_MATCH`), `vlm_probe` (contrato M4-C **desactivado por defecto**) y `blocks`.
+### 1. Motor de filtros componibles estilo `ffmpeg` para capturas (`flowsight_screen.py`)
+Pipeline determinista `-vf "f1=...,f2,..."` (OpenCV + NumPy + SciPy + Pillow) con **10 filtros declarativos** (`--filters`), coordenadas globales `[x0, y0, x1, y1)` exclusivas y centros `click=(cx, cy)`:
+
+- **`crop=x:y:w:h`** — zoom a una subregión preservando coordenadas globales exactas.
+- **`theme`** — polaridad (`dark`/`light`/`mixed`), luminancia mediana, superficies dominantes y colores acento.
+- **`layout`** — divisores estructurales `H`/`V` y paneles `P0..Pn` con `area_pct`, fondo y pista posicional.
+- **`controls`** — detección geométrica de controles candidatos `W0..Wn` (botones acento, inputs, badges, tarjetas/modales) con `click=(cx, cy)`.
+- **`text_bands`** — detección geométrica de bandas de texto `T0..Tn` (sin OCR).
+- **`ocr`** ([`flowsight_ocr.py`](flowsight_ocr.py)) — **OCR local real en CPU sin red** (`backend=auto|tesseract|rapidocr`, usando `rapidocr-onnxruntime` PP-OCRv4 ONNX o `tesseract` si está instalado), con confianza y escala documentada (`OCR_OBSERVED` / `OCR_UNCERTAIN` / `OCR_ABSENT` fail-closed) + **asociación geométrica texto ↔ controles** (`TEXT_INSIDE`, `LABEL_ASSOCIATED`, `AMBIGUOUS_ASSOCIATION`, `NO_TEXT_EVIDENCE`) y métricas exactas `CER`/`WER`.
+- **`ui_map`** — mapa wireframe ASCII compacto de divisores, controles y texto.
+- **`ui_diff=before.png`** ([`flowsight_diff.py`](flowsight_diff.py)) — **diff basado en identidad temporal** con asignación global óptima (`scipy.optimize.linear_sum_assignment`), tracks persistentes `track=K0..Kn` separados de los índices locales `W_i`, preservación de ambos frames y 9 clasificaciones (`NEW_CONTROL`, `REMOVED_CONTROL`, `MOVED_CONTROL`, `RESIZED_CONTROL`, `TEXT_CHANGED`, `COLOR_CHANGED`, `STATE_CHANGED_CANDIDATE` [`INFERRED`], `UNCHANGED_CONTROL`, `AMBIGUOUS_MATCH`).
+- **`vlm_probe`** ([`flowsight_vlm.py`](flowsight_vlm.py)) — escalación opcional a un VLM **apagada por defecto (fail-closed)**, estrictamente limitada a recortes (`crop=x:y:w:h` obligatorio, `<= 1024 px/lado`, `<= 512×512 px`), loopback por defecto (`allow_remote=False`), adaptador OpenAI-compatible en CLI (`--enable-vlm`) y MCP (`FLOWSIGHT_VLM_ENABLED=1`), salida siempre marcada `VLM_INFERRED`.
+- **`blocks`** — acopla el particionado en mitades/cuartos y costuras del motor M2.
+
+### 2. Búsqueda visual progresiva con geometría verificable (`flowsight_index.py`, M5-A)
+Evita volcar múltiples capturas completas al contexto del LLM:
+- **Indexado explícito y efímero:** SQLite + **FTS5** (`unicode61` preservando tokens técnicos `-_./:` como `3128/tcp` o `br-575398bb8361`), guardado fuera de git en `~/.local/share/flowsight/progressive_index.sqlite` (`0700`/`0600`), **0 bytes de píxeles almacenados**, deduplicación por `SHA-256` y ciclo de vida explícito (`--ttl-hours`, `expire`, `purge`). Nunca escanea carpetas en segundo plano.
+- **Ranking + recorte listo para profundizar:** `search` filtra por texto, `theme`, `color` y fechas, devuelve top-K con fragmentos OCR, `bbox` global exacto y `deepen_vf="crop=x:y:w:h,controls,ocr"`.
+- **Ahorro medido** ([`reports/GATES_M5.md`](reports/GATES_M5.md)): en el benchmark de 7 capturas `1280×720` (`query="UFW 3128"`), pasó de `21,931 chars` (7 reportes completos) a `2,037 chars` (`search + crop` ganador) — **`90.71 %` menos contexto** y re-indexado cacheado en `1.90 ms`.
+
+### 3. Percepción temporal sobre videos y secuencias (`flowsight_timeline.py`, M5-B)
+Extiende la analogía con FFmpeg a secuencias ordenadas de capturas y videos `.mp4/.mkv/.webm/.avi` (`cv2.VideoCapture`):
+- **Salto de fotogramas estáticos por bloques (`8×6` tiles):** ignora frames repetidos/ruido de compresión pero detecta cambios localizados (~1 % de pantalla, como un solo botón cambiando de color o un banner de error).
+- **Eventos con timestamp y `bbox` global:** encadena `track=K0..Kn` entre keyframes y emite `CONTROL_APPEARED`, `CONTROL_DISAPPEARED`, `CONTROL_COLOR_CHANGED` (+ `INFERRED=['STATE_CHANGED_CANDIDATE']`), `CONTROL_MOVED`, `CONTROL_RESIZED`, `CONTROL_TEXT_CHANGED`, `TEXT_APPEARED` y `TEXT_DISAPPEARED`, filtrables con `--query`.
+
+### 4. Partición por bloques `1920×1080` y unión estructural (`flowsight_blocks.py`, M2)
+Para fotografías e imágenes grandes (>64 colores, hasta `8192 px`):
+- Partición en mitades (`halves_h`, `halves_v`) o cuartos (`quarters`: `TL/TR/BL/BR`) + **subdivisión recursiva (quadtree)** con paleta compartida cuantizada (`median-cut` + Lloyd k-means determinista) y métricas reales de error (`MAE_RGB`, `RMSE_RGB`, `PSNR_dB`).
+- Mapa de color + mapa de bordes Sobel por bloque y `stitch_blocks` que mide continuidad real píxel a píxel en costuras, fusiona regiones `CROSS-SEAM` (`G0..Gn`) y alinea notas del agente.
+
+### 5. Modo lossless SQLite para programas FLOW y pixel art (`flowsight.py` + `flowsight_flow.py`, M0/M1)
+- **`--mode flow` (`flowsight-flow-v1`):** índice nativo de 3 canales sin pérdida ni cuantización para programas de `FLOW` (soporta >64 colores RGB como `vortex.png` y `hello_flow.png`): `R/G` campo vectorial continuo exacto (magnitud, coherencia, divergencia, curl) y `B` instrucciones/datos discretos en RLE exacto + `spawns` (`B=255`). Reconstrucción byte a byte con verificación SHA-256 e invariancia demostrada de trazas en la VM real de `FLOW`.
+- **`--mode visual` (`flowsight-rle-v1`):** raster discreto lossless (≤64 colores RGBA exactos) con `summary` L0, marcadores `[hidden-in-minimap]` para colores minoritarios, `region --grid` 1:1, `edges --region`, `diff` con transiciones de color y `export-flowpaint`.
+
+### 6. Corpus privado de fallos por PC (`flowsight_corpus.py`) e integración con ISyCode TUI
+- Registra fallos de percepción confirmados por el usuario (p. ej. tras confirmación vía `ask_user`) en `~/.local/share/flowsight/private_failures/` (`0700`/`0600`, `machine_id` UUID4 aleatorio único por PC, fuera de git y sin copiar capturas salvo `--save-local-copy`).
+- Integrado con el fallback para modelos sin visión de [ISyCode](https://github.com/DannyBaanks/ISyCode) ([PR #123](https://github.com/DannyBaanks/ISyCode/pull/123)): al pegar una imagen en un modelo sin visión nativa, el agente inspecciona con FlowSight, explica `DEMONSTRATED` vs `INFERRED`, confirma con `ask_user` y registra errores reales en el corpus privado local.
+
+---
+
+## Servidor MCP (`flowsight_mcp.py` — 14 tools stdio)
+
+Expone **14 tools** (solo lectura sobre imágenes/videos; compatible con `mcp 2.x` y configuración local `~/.config/isycode/mcp.json` o `isymcp-hub` — ver guía detallada en [`docs/MCP_REGISTRATION.md`](docs/MCP_REGISTRATION.md)):
+
+| Grupo | Tools |
+|---|---|
+| **Filtros de pantalla (M3/M4)** | `flowsight_screen_filters`, `flowsight_screen_run`, `flowsight_screen_query` |
+| **Índice progresivo (M5-A)** | `flowsight_index_add`, `flowsight_index_search`, `flowsight_index_purge` |
+| **Timeline / Video (M5-B)** | `flowsight_timeline_scan` |
+| **Bloques 1920×1080 (M2)** | `flowsight_map_blocks`, `flowsight_get_block`, `flowsight_subdivide_block`, `flowsight_stitch_blocks` |
+| **Lossless FLOW / Visual (M1)** | `flowsight_inspect_lossless` |
+| **Corpus privado de fallos** | `flowsight_log_failure`, `flowsight_list_failures` |
+
+---
+
+## Instalación rápida y uso CLI
+
+Requisitos: Python ≥3.10, `Pillow`, `numpy`, `opencv-python`, `scipy`, `mcp` (para el servidor MCP) y opcionalmente `rapidocr-onnxruntime` o `tesseract` para OCR local real.
 
 ```bash
-# Ver catálogo declarativo de filtros (estilo `ffmpeg -filters`)
+python3 -m pip install -r requirements.txt
+
+# --- Capturas de pantalla estilo ffmpeg (M3/M4) ---
 python3 flowsight_screen.py --filters
-
-# Analizar captura 1920x1080 con OCR + asociación a controles
 python3 flowsight_screen.py -i screen.png -vf "theme,layout,controls,text_bands,ocr,ui_map=48:20"
-
-# Diff basado en identidad temporal (tracks persistentes K0..Kn)
-python3 flowsight_screen.py -i after.png -vf "layout,controls,ocr,ui_diff=before.png"
+python3 flowsight_screen.py -i after.png  -vf "layout,controls,ocr,ui_diff=before.png"
 
 # Escalación VLM opt-in SOLO sobre recorte explícito (apagada por defecto)
 python3 flowsight_screen.py -i screen.png \
   -vf "crop=250:510:270:68,vlm_probe=question=Describe el icono y estado visual" \
   --enable-vlm --vlm-url http://127.0.0.1:11434/v1/chat/completions --vlm-model qwen2.5vl
 
-# Corpus privado local de fallos (único por PC, fuera de git: ~/.local/share/flowsight/private_failures/)
-python3 flowsight_corpus.py list
-python3 flowsight_corpus.py stats
-
-# M5-A: Búsqueda visual progresiva (SQLite + FTS5 + TTL, sin guardar píxeles)
+# --- Búsqueda visual progresiva (M5-A) ---
 python3 flowsight_index.py add ./capturas/ --ttl-hours 24
 python3 flowsight_index.py search "UFW 3128" --theme dark --limit 3
 python3 flowsight_index.py purge --mode expired
 
-# M5-B: Timeline temporal sobre video (.mp4/.mkv/.webm) o secuencia de capturas
-python3 flowsight_timeline.py demo.mp4 --fps 2 --query "exit=56"
-```
+# --- Timeline sobre video o secuencia de capturas (M5-B) ---
+python3 flowsight_timeline.py grabacion.mp4 --fps 2 --query "exit=56"
+python3 flowsight_timeline.py frame1.png frame2.png frame3.png
 
-Registro manual y reversible en `isymcp-hub` (sin modificar el daemon automáticamente): ver [`docs/MCP_REGISTRATION.md`](docs/MCP_REGISTRATION.md).
-
-### 0. Modo bloques alta resolución (`flowsight_blocks.py`) y Servidor MCP (`flowsight_mcp.py`)
-Para fotos y screenshots grandes (`1920×1080` o cualquier PNG/JPG/WEBP hasta `8192px`, >64 colores) donde el modo lossless rechaza por diseño:
-- **Explícitamente aproximado (`photo-blocks-v1`):** paleta global compartida (`median-cut` + refinamiento Lloyd k-means determinista) con métricas reales de error (`MAE_RGB`, `RMSE_RGB`, `PSNR_dB`, `within_d24%`).
-- **Partición en mitades o cuartos** (`quarters`: `TL/TR/BL/BR`; `halves_h`: `L/R`; `halves_v`: `T/B`) + **subdivisión recursiva** (quadtree zoom) con mapa de color y **mapa de bordes Sobel** por bloque.
-- **Unión estructural y semántica (`stitch_blocks`):** mide continuidad píxel a píxel en las costuras reales, fusiona regiones trans-frontera (`G0..Gn [CROSS-SEAM]`), re-ensambla el mapa global y alinea notas textuales por bloque (`AGENT_NOTES / INFERRED`).
-
-```bash
-# CLI directo de bloques 1920x1080
+# --- Bloques 1920x1080 + stitch (M2) ---
 python3 flowsight_blocks.py map foto_1080p.png --split quarters --colors 12
 python3 flowsight_blocks.py block <session_id> TL
-python3 flowsight_blocks.py subdivide <session_id> TL --split quarters
-python3 flowsight_blocks.py stitch <session_id> --notes-json '{"TL":"...","TR":"..."}'
+python3 flowsight_blocks.py stitch <session_id>
 
-# Arrancar servidor MCP stdio (mcp 2.x)
+# --- Programas FLOW y pixel art lossless (M1) ---
+python3 flowsight.py index /ruta/a/FLOW/examples/vortex.png vortex.sqlite --mode flow
+python3 flowsight.py summary vortex.sqlite
+python3 flowsight.py field vortex.sqlite --region 16 16 32 32 --cols 8 --rows 8
+python3 flowsight.py verify vortex.sqlite /ruta/a/FLOW/examples/vortex.png
+
+# --- Corpus privado de fallos local por PC ---
+python3 flowsight_corpus.py list
+python3 flowsight_corpus.py stats
+
+# --- Servidor MCP stdio ---
 python3 flowsight_mcp.py
 ```
 
-Snippet listo para registrar en `~/.codex-web-http/hub/servers.json` (cuando decidas habilitarlo en `isymcp-hub`):
-```json
-"flowsight": {
-  "command": "python3",
-  "args": ["/home/danny/Development/ISyCo Git/FlowSight/flowsight_mcp.py"],
-  "cwd": "/home/danny/Development/ISyCo Git/FlowSight",
-  "isolation": "shared"
-}
-```
-
-### 1. `--mode flow` — Índice nativo de 3 canales para programas FLOW (`flowsight-flow-v1`)
-Los programas FLOW (`DannyBaanks/FLOW`) codifican **dos capas distintas en la misma imagen RGB**:
-- **Canales `R, G` (campo vectorial continuo):** almacenados **sin pérdida ni cuantización** como arrays `uint8` exactos (`vx = R/127.5 - 1`, `vy = G/127.5 - 1`), acompañados de resúmenes espaciales deterministas por tiles, estadísticas regionales exactas (media, magnitud, coherencia, divergencia y rotacional/curl en diferencias finitas exactas) y grillas direccionales.
-- **Canal `B` (instrucciones y datos discretos `0..255`):** almacenado en RLE exacto por fila, paleta de opcodes, componentes 4-conexos y tabla directa de `spawns` (`B=255`).
-- **Sin rechazo por >64 colores RGB:** programas reales como `FLOW/examples/vortex.png` (873 colores RGB distintos) y `FLOW/examples/hello_flow.png` se indexan y reconstruyen con **0 errores en R, G y B**, manteniendo invariantes las trazas de la VM real de FLOW.
-- **Aclaración epistémica:** el mapa de flechas por tile en L0 y `field` es un *resumen aproximado* de la media local; los valores exactos sin cuantizar se consultan con `point`, `scanline`, `region`, `field` e `instructions`. FlowSight observa el programa estático y **nunca ejecuta la VM de FLOW**.
-
-### 2. `--mode visual` — Índice raster discreto (`flowsight-rle-v1`) + mejoras de fóvea M1
-Para pixel art, sprites y diagramas discretos (PNG, 1..512 por lado, ≤64 colores RGBA exactos; rechaza >64 colores sin cuantizar silenciosamente):
-- `summary` (L0): paleta en orden determinista, minimapa `24×16` por mayoría (≥60% o `?`), **marcadores explícitos `[hidden-in-minimap]` con `bbox` exacto para colores minoritarios** ausentes del minimapa, y top componentes 4-conexos.
-- `region X Y W H --grid`: vista simbólica **1:1 exacta** para fóveas pequeñas (límite fail-closed: ≤64×64 y ≤1024 px).
-- `edges --region X Y W H`: fronteras discretas `V`/`H` acotadas a una caja sin truncamiento global.
-- `diff`: reporta `CHANGED BBOX` y **transiciones exactas de color** (`C_old(#hex) -> C_new(#hex)`).
-- `export-flowpaint`: exporta al subconjunto `CANVAS / COLOR / RECT` compatible con `flow.paint.painter.run_paint_program`.
-
----
-
-## Instalación y pruebas
-
-Requisitos: Python ≥3.10 y `Pillow`.
+### Ejecutar pruebas
 
 ```bash
-python3 -m pip install -r requirements.txt
-
-# Suite completa (con FLOW en PYTHONPATH se ejecutan también los gates nativos)
-PYTHONPATH="/home/danny/Development/ISyCo Git/FLOW:." python3 -m unittest discover -s tests -v
-
-# Benchmark y gates de M1 Prioridad 1 sobre programas FLOW reales
-python3 examples/benchmark_m1_p1.py
+# Suite completa (con FLOW en PYTHONPATH se ejecutan también los gates nativos de VM)
+PYTHONPATH="/ruta/a/FLOW:." python3 -m unittest discover -s tests -v
 ```
 
 ---
 
-## CLI
+## Garantías de seguridad, privacidad y coordenadas
 
-```bash
-# --- Programas FLOW (nativo 3 canales, lossless) ---
-python3 flowsight.py index "/home/danny/Development/ISyCo Git/FLOW/examples/vortex.png" vortex.sqlite --mode flow
-python3 flowsight.py summary vortex.sqlite
-python3 flowsight.py field vortex.sqlite --region 16 16 32 32 --cols 8 --rows 8
-python3 flowsight.py instructions vortex.sqlite --limit 20
-python3 flowsight.py region vortex.sqlite 30 30 5 5 --grid
-python3 flowsight.py point vortex.sqlite 32 29
-python3 flowsight.py scanline vortex.sqlite 29
-python3 flowsight.py verify vortex.sqlite "/home/danny/Development/ISyCo Git/FLOW/examples/vortex.png"
-python3 flowsight.py rebuild vortex.sqlite vortex_rebuilt.png
-
-# --- Imágenes visuales discretas (<=64 colores RGBA) ---
-python3 flowsight.py index examples/sprite.png sprite.sqlite
-python3 flowsight.py summary sprite.sqlite
-python3 flowsight.py region sprite.sqlite 12 20 12 10 --grid
-python3 flowsight.py edges sprite.sqlite --region 12 20 12 10
-python3 flowsight.py diff sprite.sqlite examples/sprite_edited.png
-python3 flowsight.py export-flowpaint sprite.sqlite sprite.flowpaint
-```
+- **Coordenadas:** origen `(0, 0)` en esquina superior izquierda; `x` hacia la derecha, `y` hacia abajo; cajas `[x0, y0, x1, y1)` con extremo final **exclusivo**.
+- **Sin acciones destructivas ni clics automáticos:** FlowSight informa coordenadas y evidencia; nunca hace clic ni modifica imágenes originales.
+- **Privacidad local por defecto:** tanto el índice progresivo (`~/.local/share/flowsight/progressive_index.sqlite`) como el corpus privado de fallos (`~/.local/share/flowsight/private_failures/`) viven fuera de git con permisos `0700`/`0600` y jamás copian capturas privadas sin consentimiento explícito.
+- **Límites explícitos (`NOT_DEMONSTRATED`):** no reemplaza visión multimodal nativa universal sobre escenas naturales del mundo físico, no verifica interactividad real solo por apariencia visual, no ejecuta la VM dinámica de `FLOW` y mantiene `vlm_probe` apagado por defecto.
 
 ---
 
-## Sistema de coordenadas y garantías fail-closed
+## Evidencia y reportes por milestone
 
-- Origen `(0,0)` en esquina superior izquierda; `x` aumenta hacia la derecha, `y` hacia abajo; cajas `[x0, y0, x1, y1)` con extremos finales **exclusivos**.
-- Verificación de integridad SHA-256 por canal (`r_sha256`, `g_sha256`, `b_sha256`, `rgb_sha256`, `rgba_sha256`) al abrir y reconstruir.
-- Escritura atómica vía archivo temporal + `os.replace`; lectura en SQLite `?mode=ro`; nunca sobrescribe sin `--force`.
-- Determinismo byte a byte en índices SQLite, resúmenes L0 y salidas de consulta.
-- **Límites explícitos (`NOT_DEMONSTRATED`):** el modo lossless (`flowsight.py`) no hace reconocimiento semántico de fotos/objetos humanos, no hace OCR (el OCR vive en `flowsight_screen.py` M4), no cuantiza imágenes >64 colores en `--mode visual`, ni predice la ejecución dinámica multi-tick de la VM de FLOW sin ejecutarla.
-
----
-
-## Evidencia y reportes
-
-- [`evidence/m0/`](evidence/m0/) — Evidencia original M0 intacta (`GATES.md`, `M0_SHA256SUMS.txt`, benchmarks y artefactos).
-- [`evidence/m1_p1/`](evidence/m1_p1/) — Benchmark, índices, L0 y verificación de gates M1 Prioridad 1 sobre `hello_flow.png` y `vortex.png`.
-- [`evidence/m1_blind/`](evidence/m1_blind/) — Transcripts completos y auditoría de los experimentos ciegos M1 (`m1_a_vortex`, `m1_b_hello_flow`, `m1_c_visual_p2`).
-- [`evidence/m2_blocks/`](evidence/m2_blocks/) — Artefactos 1920×1080, salidas de bloques/stitch y transcript real con NVIDIA NIM (`nemotron-3.5-lightning-30b-a3b`).
-- [`evidence/m3_screen/`](evidence/m3_screen/) — Capturas UI 1920×1080, reportes `-vf`, `ui_diff` y transcript ciego con NVIDIA NIM.
-- [`evidence/m4/`](evidence/m4/) — Corpus adversarial de 13 casos con `ground_truth.json`, `benchmark_m4.json`, ejemplos OCR/`ui_diff` y transcript ciego M4 con NVIDIA NIM.
-- [`evidence/m5/`](evidence/m5/) — Benchmark de 7 capturas (`90.71%` de ahorro de contexto), `demo_timeline.mp4`, ejemplos de búsqueda progresiva/zoom/timeline y `SHA256SUMS_M5.txt`.
-- [`reports/GATES_M1.md`](reports/GATES_M1.md) — Matriz consolidada M1 (`DEMONSTRATED`, `INFERRED`, `NOT_DEMONSTRATED`).
-- [`reports/GATES_M2.md`](reports/GATES_M2.md) — Matriz consolidada M2 (bloques 1920×1080, stitching, MCP stdio E2E y experimento NVIDIA NIM).
-- [`reports/GATES_M3.md`](reports/GATES_M3.md) — Matriz consolidada M3 (motor de filtros estilo `ffmpeg` para capturas de pantalla).
-- [`reports/GATES_M4.md`](reports/GATES_M4.md) — Matriz consolidada M4 (OCR real + asociación texto-control, `ui_diff` por identidad temporal, contrato `vlm_probe` y experimento ciego Q1..Q6).
-- [`reports/GATES_M5.md`](reports/GATES_M5.md) — Matriz consolidada M5 (índice visual progresivo SQLite+FTS5+TTL y timeline temporal sobre video/secuencias).
+| Milestone | Reporte de gates | Evidencia hasheada |
+|---|---|---|
+| **M0** (PoC raster lossless) | [`evidence/m0/GATES.md`](evidence/m0/GATES.md) | [`evidence/m0/`](evidence/m0/) |
+| **M1** (`--mode flow` 3 canales + fóvea visual + ciego) | [`reports/GATES_M1.md`](reports/GATES_M1.md) | [`evidence/m1_p1/`](evidence/m1_p1/), [`evidence/m1_blind/`](evidence/m1_blind/) |
+| **M2** (bloques 1920×1080 + stitch + MCP + NIM) | [`reports/GATES_M2.md`](reports/GATES_M2.md) | [`evidence/m2_blocks/`](evidence/m2_blocks/) |
+| **M3** (filtros `-vf` estilo `ffmpeg` para pantallas) | [`reports/GATES_M3.md`](reports/GATES_M3.md) | [`evidence/m3_screen/`](evidence/m3_screen/) |
+| **M4** (OCR local real + `ui_diff` temporal + `vlm_probe` + ciego Q1..Q6) | [`reports/GATES_M4.md`](reports/GATES_M4.md) | [`evidence/m4/`](evidence/m4/) |
+| **M5** (índice progresivo SQLite+FTS5 + timeline video/secuencias) | [`reports/GATES_M5.md`](reports/GATES_M5.md) | [`evidence/m5/`](evidence/m5/) |
 
 ## Licencia
 
-CC0 / dominio público, alineado con `FLOW` y `FlowGen`.
+CC0 / dominio público, alineado con [FLOW](https://github.com/DannyBaanks/FLOW) y [FlowGen](https://github.com/DannyBaanks/FlowGen).
