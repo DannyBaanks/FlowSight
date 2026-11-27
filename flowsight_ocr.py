@@ -12,12 +12,17 @@ Epistemic guarantees:
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import math
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable
 
 import numpy as np
@@ -27,6 +32,7 @@ OCR_OBSERVED = 'OCR_OBSERVED'
 OCR_UNCERTAIN = 'OCR_UNCERTAIN'
 OCR_ABSENT = 'OCR_ABSENT'
 OCR_ERROR = 'OCR_ERROR'
+OCR_EMPTY = 'OCR_EMPTY'  # Empty result (zero items) - does NOT prove absence of text
 
 ASSOC_INSIDE = 'TEXT_INSIDE'
 ASSOC_LABEL = 'LABEL_ASSOCIATED'
@@ -37,7 +43,224 @@ DEFAULT_MIN_OBSERVED_CONF = 60.0
 TESSERACT_CONF_SCALE = 'tesseract_0_100_uncalibrated (NOT calibrated probability)'
 RAPIDOCR_CONF_SCALE = 'rapidocr_0_100_uncalibrated (raw 0..1 x100; NOT calibrated probability)'
 
-_RAPIDOCR_SINGLETON: Any = None
+# Environment variable for opt-in multilingual recognition model
+FLOWSIGHT_OCR_REC_MODEL_ENV = 'FLOWSIGHT_OCR_REC_MODEL'
+
+# ============================================================================
+# OCR result cache (in-process LRU)
+# Key: (image_sha256, crop_bbox, backend, params_hash)
+# Bounded to 32 entries
+# ============================================================================
+
+_OCR_CACHE_MAX = 32
+_ocr_cache: OrderedDict[tuple, tuple[dict, str]] = OrderedDict()  # key -> (result, cache_status)
+_ocr_cache_lock = threading.Lock()
+
+
+def _image_sha256(rgb: np.ndarray) -> str:
+    """Compute SHA256 of image bytes."""
+    return hashlib.sha256(rgb.tobytes()).hexdigest()
+
+
+def _ocr_cache_key(
+    rgb: np.ndarray,
+    offset_x: int,
+    offset_y: int,
+    backend: str,
+    lang: str,
+    min_observed_conf: float,
+    psm: int,
+    rec_model: str | None = None,
+) -> tuple:
+    """Generate cache key for OCR result."""
+    img_hash = _image_sha256(rgb)
+    crop_bbox = (offset_x, offset_y, offset_x + rgb.shape[1], offset_y + rgb.shape[0])
+    params = (backend, lang, min_observed_conf, psm, rec_model or '')
+    return (img_hash, crop_bbox, params)
+
+
+def _get_cached_ocr(
+    rgb: np.ndarray,
+    offset_x: int,
+    offset_y: int,
+    backend: str,
+    lang: str,
+    min_observed_conf: float,
+    psm: int,
+    rec_model: str | None = None,
+) -> tuple[dict | None, str]:
+    """Get cached OCR result. Returns (result, cache_status) where cache_status is 'HIT' or 'MISS'."""
+    key = _ocr_cache_key(rgb, offset_x, offset_y, backend, lang, min_observed_conf, psm, rec_model)
+
+    with _ocr_cache_lock:
+        if key in _ocr_cache:
+            result, _ = _ocr_cache[key]
+            _ocr_cache.move_to_end(key)
+            res_copy = copy.deepcopy(result)
+            res_copy['cache'] = 'HIT'
+            return res_copy, 'HIT'
+        return None, 'MISS'
+
+
+def _set_cached_ocr(
+    rgb: np.ndarray,
+    offset_x: int,
+    offset_y: int,
+    backend: str,
+    lang: str,
+    min_observed_conf: float,
+    psm: int,
+    result: dict,
+    rec_model: str | None = None,
+) -> None:
+    """Store OCR result in LRU cache."""
+    key = _ocr_cache_key(rgb, offset_x, offset_y, backend, lang, min_observed_conf, psm, rec_model)
+
+    with _ocr_cache_lock:
+        _ocr_cache[key] = (copy.deepcopy(result), 'HIT')
+        _ocr_cache.move_to_end(key)
+        while len(_ocr_cache) > _OCR_CACHE_MAX:
+            _ocr_cache.popitem(last=False)
+
+
+def _invalidate_ocr_cache_for_image(rgb: np.ndarray) -> None:
+    """Invalidate all cache entries for a given image."""
+    img_hash = _image_sha256(rgb)
+    with _ocr_cache_lock:
+        keys_to_remove = [k for k in _ocr_cache.keys() if k[0] == img_hash]
+        for k in keys_to_remove:
+            del _ocr_cache[k]
+
+
+# ============================================================================
+# Column-aware reading order for OCR items
+# ============================================================================
+
+def _detect_vertical_gutters(items: list[dict], image_width: int, min_gutter_width: int = 20) -> list[tuple[int, int]]:
+    """Detect vertical gutters (x ranges with no text boxes where both sides span vertically).
+    Returns list of (x_start, x_end) for each gutter.
+    """
+    if len(items) < 4:
+        return []
+
+    min_y = min(it['bbox'][1] for it in items)
+    max_y = max(it['bbox'][3] for it in items)
+    total_y_span = max(1, max_y - min_y)
+
+    # Collect all x-ranges covered by text boxes
+    x_coverage = [0] * (image_width + 1)
+    for it in items:
+        x0, x1 = it['bbox'][0], it['bbox'][2]
+        x0 = max(0, min(x0, image_width))
+        x1 = max(0, min(x1, image_width))
+        for x in range(x0, x1):
+            x_coverage[x] += 1
+
+    # Find columns (contiguous x ranges with coverage > 0)
+    raw_columns = []
+    in_column = False
+    col_start = 0
+    for x in range(image_width + 1):
+        if x_coverage[x] > 0 and not in_column:
+            in_column = True
+            col_start = x
+        elif x_coverage[x] == 0 and in_column:
+            in_column = False
+            raw_columns.append((col_start, x - 1))
+    if in_column:
+        raw_columns.append((col_start, image_width))
+
+    # Merge adjacent columns unless both sides have at least 2 distinct vertical rows
+    # or span at least 45% of total vertical text span (prevents splitting a single row of horizontal buttons)
+    def _col_is_vertical_pane(x0: int, x1: int) -> bool:
+        c_items = [it for it in items if x0 <= (it['bbox'][0] + it['bbox'][2]) // 2 <= x1]
+        if len(c_items) < 2:
+            return False
+        y_bands = {it['bbox'][1] // 15 for it in c_items}
+        c_span = max(it['bbox'][3] for it in c_items) - min(it['bbox'][1] for it in c_items)
+        return len(y_bands) >= 2 and (c_span >= total_y_span * 0.40 or len(y_bands) >= 3)
+
+    gutters = []
+    for i in range(len(raw_columns) - 1):
+        gap_start = raw_columns[i][1] + 1
+        gap_end = raw_columns[i + 1][0] - 1
+        if gap_end - gap_start + 1 >= min_gutter_width:
+            left_x0 = 0 if not gutters else gutters[-1][1] + 1
+            left_x1 = gap_start - 1
+            right_x0 = gap_end + 1
+            right_x1 = image_width
+            if _col_is_vertical_pane(left_x0, left_x1) and _col_is_vertical_pane(right_x0, right_x1):
+                gutters.append((gap_start, gap_end))
+
+    return gutters
+
+
+def _order_items_column_aware(items: list[dict]) -> list[dict]:
+    """Order OCR items column by column, top to bottom.
+    Detects vertical gutters and groups items by column.
+    Falls back to (y//10, x) ordering if no clear gutters.
+    Assigns sequential IDs O0..On in reading order.
+    """
+    if not items:
+        return items
+
+    # Estimate image width from max bbox x1
+    image_width = max(it['bbox'][2] for it in items)
+
+    # Detect gutters
+    gutters = _detect_vertical_gutters(items, image_width)
+
+    if not gutters:
+        # No clear gutters - fall back to original ordering
+        ordered = sorted(items, key=lambda r: (r['bbox'][1] // 10, r['bbox'][0]))
+        for idx, it in enumerate(ordered):
+            it['id'] = f'O{idx}'
+        return ordered
+
+    # Assign each item to a column based on its center x
+    columns = []
+    prev_end = -1
+    for gutter_start, gutter_end in gutters:
+        col_x0 = prev_end + 1
+        col_x1 = gutter_start - 1
+        if col_x1 >= col_x0:
+            columns.append((col_x0, col_x1))
+        prev_end = gutter_end
+    # Last column
+    if prev_end < image_width:
+        columns.append((prev_end + 1, image_width))
+
+    # If only one column, fall back
+    if len(columns) <= 1:
+        ordered = sorted(items, key=lambda r: (r['bbox'][1] // 10, r['bbox'][0]))
+        for idx, it in enumerate(ordered):
+            it['id'] = f'O{idx}'
+        return ordered
+
+    # Group items by column
+    column_items: dict[int, list[dict]] = {i: [] for i in range(len(columns))}
+    for it in items:
+        cx = (it['bbox'][0] + it['bbox'][2]) // 2
+        col_idx = 0
+        for i, (col_x0, col_x1) in enumerate(columns):
+            if col_x0 <= cx <= col_x1:
+                col_idx = i
+                break
+        column_items[col_idx].append(it)
+
+    # Sort each column by y, then concatenate
+    ordered = []
+    for i in range(len(columns)):
+        col_items = column_items[i]
+        col_items.sort(key=lambda r: (r['bbox'][1] // 10, r['bbox'][0]))
+        ordered.extend(col_items)
+
+    for idx, it in enumerate(ordered):
+        it['id'] = f'O{idx}'
+    return ordered
+
+
+_RAPIDOCR_SINGLETON: dict[str, Any] = {}
 
 
 def detect_rapidocr_engine() -> tuple[bool, str]:
@@ -50,12 +273,16 @@ def detect_rapidocr_engine() -> tuple[bool, str]:
         return False, 'absent'
 
 
-def _get_rapidocr_instance():
+def _get_rapidocr_instance(rec_model_path: str | None = None):
     global _RAPIDOCR_SINGLETON
-    if _RAPIDOCR_SINGLETON is None:
+    eff_rec = rec_model_path or os.environ.get(FLOWSIGHT_OCR_REC_MODEL_ENV) or ''
+    if eff_rec not in _RAPIDOCR_SINGLETON:
         from rapidocr_onnxruntime import RapidOCR
-        _RAPIDOCR_SINGLETON = RapidOCR()
-    return _RAPIDOCR_SINGLETON
+        if eff_rec:
+            _RAPIDOCR_SINGLETON[eff_rec] = RapidOCR(rec_model_path=eff_rec)
+        else:
+            _RAPIDOCR_SINGLETON[eff_rec] = RapidOCR()
+    return _RAPIDOCR_SINGLETON[eff_rec]
 
 
 def _run_rapidocr(
@@ -65,6 +292,7 @@ def _run_rapidocr(
     source_frame: str,
     lang: str,
     min_observed_conf: float,
+    rec_model_path: str | None = None,
 ) -> dict[str, Any]:
     t0 = time.perf_counter()
     avail, engine_ver = detect_rapidocr_engine()
@@ -82,7 +310,7 @@ def _run_rapidocr(
             'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
         }
     try:
-        engine = _get_rapidocr_instance()
+        engine = _get_rapidocr_instance(rec_model_path=rec_model_path)
         # RapidOCR expects BGR or RGB numpy array (PIL/RGB works cleanly; pass BGR for cv2 native consistency)
         bgr = rgb[:, :, ::-1].copy()
         result, _elapse = engine(bgr)
@@ -126,13 +354,19 @@ def _run_rapidocr(
             'status': st,
         })
 
-    items.sort(key=lambda r: (r['bbox'][1] // 10, r['bbox'][0]))
+    # Column-aware ordering
+    items = _order_items_column_aware(items)
+
     for idx, it in enumerate(items):
         it['id'] = f'O{idx}'
 
-    overall = OCR_OBSERVED if any(it['status'] == OCR_OBSERVED for it in items) else (
-        OCR_UNCERTAIN if items else OCR_OBSERVED
-    )
+    # Determine overall status: OCR_EMPTY if zero items, else based on item statuses
+    if not items:
+        overall = OCR_EMPTY
+        detail = '0 line(s) extracted via RapidOCR; empty result does NOT prove absence of text'
+    else:
+        overall = OCR_OBSERVED if any(it['status'] == OCR_OBSERVED for it in items) else OCR_UNCERTAIN
+        detail = f'{len(items)} line(s) extracted via RapidOCR; empty result does NOT prove absence of text'
     return {
         'status': overall,
         'engine': engine_ver,
@@ -140,7 +374,7 @@ def _run_rapidocr(
         'source_frame': source_frame,
         'lang': lang,
         'preprocessing': 'native_bgr',
-        'detail': f'{len(items)} line(s) extracted via RapidOCR; empty result does NOT prove absence of text',
+        'detail': detail,
         'items': items,
         'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
     }
@@ -205,6 +439,7 @@ def run_ocr(
     timeout_s: float = 30.0,
     backend: str = 'auto',
     provider: Callable[..., dict[str, Any]] | None = None,
+    rec_model_path: str | None = None,
 ) -> dict[str, Any]:
     """Run local OCR (`tesseract` or `rapidocr-onnxruntime`) over an RGB array.
 
@@ -212,24 +447,57 @@ def run_ocr(
       - 'auto' (default): uses `tesseract` if on PATH, else `rapidocr-onnxruntime` if installed, else `OCR_ABSENT`.
       - 'tesseract': require local tesseract binary (returns `OCR_ABSENT` if missing).
       - 'rapidocr': require local rapidocr-onnxruntime (returns `OCR_ABSENT` if missing).
+    `rec_model_path`: optional local ONNX recognition model path for RapidOCR (or set
+      env var `FLOWSIGHT_OCR_REC_MODEL=/path/to/latin_PP-OCRv3_rec_infer.onnx` to preserve Spanish diacritics).
     Never fabricates text when no local OCR engine is available.
     """
     t0 = time.perf_counter()
     if provider is not None:
         res = provider(rgb, offset_x=offset_x, offset_y=offset_y, source_frame=source_frame, lang=lang)
         res.setdefault('elapsed_ms', round((time.perf_counter() - t0) * 1000.0, 2))
+        res.setdefault('cache', 'BYPASS')
         return res
 
     bmode = (backend or 'auto').strip().lower()
-    if bmode == 'rapidocr':
-        return _run_rapidocr(rgb, offset_x, offset_y, source_frame, lang, min_observed_conf)
+    eff_rec = rec_model_path or os.environ.get(FLOWSIGHT_OCR_REC_MODEL_ENV) or None
 
+    # Resolve effective backend before cache lookup so 'auto' and 'rapidocr'/'tesseract' share or separate cleanly
     tess, engine_ver = detect_tesseract_engine()
+    if bmode == 'rapidocr' or (bmode == 'auto' and not tess):
+        eff_backend = 'rapidocr'
+    else:
+        eff_backend = 'tesseract'
+
+    cached_res, cache_status = _get_cached_ocr(
+        rgb, offset_x, offset_y, eff_backend, lang, min_observed_conf, psm, eff_rec
+    )
+    if cached_res is not None:
+        cached_res['source_frame'] = source_frame
+        return cached_res
+
+    if eff_backend == 'rapidocr':
+        if bmode == 'auto' and not detect_rapidocr_engine()[0]:
+            res = {
+                'status': OCR_ABSENT,
+                'engine': 'none',
+                'confidence_scale': TESSERACT_CONF_SCALE,
+                'source_frame': source_frame,
+                'lang': lang,
+                'preprocessing': 'none',
+                'detail': 'no local OCR engine available (tesseract absent on PATH; rapidocr-onnxruntime absent)',
+                'note': 'OCR_ABSENT means text could not be read; it does NOT prove the screen has no text.',
+                'items': [],
+                'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+                'cache': 'MISS',
+            }
+            return res
+        res = _run_rapidocr(rgb, offset_x, offset_y, source_frame, lang, min_observed_conf, rec_model_path=eff_rec)
+        res['cache'] = 'MISS'
+        if res['status'] not in (OCR_ABSENT, OCR_ERROR):
+            _set_cached_ocr(rgb, offset_x, offset_y, eff_backend, lang, min_observed_conf, psm, res, eff_rec)
+        return res
+
     if not tess:
-        if bmode == 'auto':
-            rap_ok, _ = detect_rapidocr_engine()
-            if rap_ok:
-                return _run_rapidocr(rgb, offset_x, offset_y, source_frame, lang, min_observed_conf)
         return {
             'status': OCR_ABSENT,
             'engine': 'none',
@@ -237,12 +505,11 @@ def run_ocr(
             'source_frame': source_frame,
             'lang': lang,
             'preprocessing': 'none',
-            'detail': 'no local OCR engine available (tesseract absent on PATH' + (
-                '; rapidocr-onnxruntime absent)' if bmode == 'auto' else ')'
-            ),
+            'detail': 'no local OCR engine available (tesseract absent on PATH)',
             'note': 'OCR_ABSENT means text could not be read; it does NOT prove the screen has no text.',
             'items': [],
             'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+            'cache': 'MISS',
         }
 
     # Dark-mode screenshots often read markedly better when inverted to dark-on-light for Tesseract.
@@ -331,24 +598,33 @@ def run_ocr(
             'status': st,
         })
 
-    items.sort(key=lambda r: (r['bbox'][1] // 10, r['bbox'][0]))
+    # Column-aware ordering
+    items = _order_items_column_aware(items)
+
     for idx, it in enumerate(items):
         it['id'] = f'O{idx}'
 
-    overall = OCR_OBSERVED if any(it['status'] == OCR_OBSERVED for it in items) else (
-        OCR_UNCERTAIN if items else OCR_OBSERVED
-    )
-    return {
+    # Determine overall status: OCR_EMPTY if zero items, else based on item statuses
+    if not items:
+        overall = OCR_EMPTY
+        detail = '0 line(s) extracted; empty result does NOT prove absence of text'
+    else:
+        overall = OCR_OBSERVED if any(it['status'] == OCR_OBSERVED for it in items) else OCR_UNCERTAIN
+        detail = f'{len(items)} line(s) extracted; empty result does NOT prove absence of text'
+    res = {
         'status': overall,
         'engine': engine_ver,
         'confidence_scale': TESSERACT_CONF_SCALE,
         'source_frame': source_frame,
         'lang': lang,
         'preprocessing': preproc,
-        'detail': f'{len(items)} line(s) extracted; empty result does NOT prove absence of text',
+        'detail': detail,
         'items': items,
         'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        'cache': 'MISS',
     }
+    _set_cached_ocr(rgb, offset_x, offset_y, eff_backend, lang, min_observed_conf, psm, res, eff_rec)
+    return res
 
 
 # ============================================================================
