@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FlowSight blind benchmark subject answers",
+  "type": "object",
+  "required": ["subject", "model", "flowsight_commit", "tool_calls", "chars_read", "answers"],
+  "properties": {
+    "subject": {"type": "string"},
+    "model": {"type": "string"},
+    "flowsight_commit": {"type": "string"},
+    "tool_calls": {"type": "integer", "minimum": 0},
+    "chars_read": {"type": "integer", "minimum": 0},
+    "answers": {
+      "type": "object",
+      "patternProperties": {
+        "^Q[0-9]+$": {
+          "type": "object",
+          "required": ["answer", "confidence"],
+          "properties": {
+            "answer": {"description": "string, number, list of strings, or {x,y[,placeholder]} for click questions"},
+            "confidence": {"enum": ["DEMONSTRATED", "INFERRED", "NOT_DEMONSTRATED"]},
+            "evidence": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
