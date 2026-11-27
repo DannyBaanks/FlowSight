@@ -1389,13 +1389,18 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
             }
         }
 
-        // 0d') ',' or '.' wedged between two lowercase letters with no space after it and at least
-        //      x-height tall is a stem that lost its top (light-on-dark AA, Noto: Va,or, loca,host).
-        if ((g.cp == ',' or g.cp == '.') and has_left and has_right and isAsciiLower(left_cp) and isAsciiLower(right_cp)) {
+        // 0d') ',' or '.' wedged inside a word (or an ascender-tall ','/'.' at word end) is a stem
+        //      that lost its top (light-on-dark AA, Noto/Liber: Va,or, loca,host, C,ick, de,).
+        if ((g.cp == ',' or g.cp == '.') and has_left and isAsciiAlpha(left_cp)) {
             if (phrase_xh) |xh| {
                 const h: f32 = @floatFromInt(g.height);
-                if (xh >= 5.0 and h >= xh - 0.5) {
-                    g.cp = if (h >= xh + @max(1.5, xh * 0.22)) 'l' else 'i';
+                const tall_stem = h >= xh + @max(1.5, xh * 0.22);
+                if (has_right and isAsciiLower(right_cp) and xh >= 5.0 and h >= xh - 0.5) {
+                    g.cp = if (tall_stem) 'l' else 'i';
+                    continue;
+                }
+                if (!has_right and isAsciiLower(left_cp) and g.width <= 3 and xh >= 5.0 and tall_stem) {
+                    g.cp = 'l';
                     continue;
                 }
             }
@@ -1503,6 +1508,19 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
             {
                 if (solid_stem or taller_than_x) {
                     g.cp = if (g.cp == ':') 'i' else 'l';
+                    continue;
+                }
+            }
+        }
+
+        // 5a') Word-boundary '!' that is a solid ascender-tall stem (no dot gap: row_cov >= 0.90)
+        //      next to a lowercase letter is an 'l' (!ocalhost, de!). A real '!' has a gap above its dot.
+        if (g.cp == '!' and g.width <= 3 and g.row_cov >= 0.90 and
+            ((has_left and isAsciiLower(left_cp) and !has_right) or (!has_left and has_right and isAsciiLower(right_cp))))
+        {
+            if (phrase_xh) |xh| {
+                if (xh >= 5.0 and @as(f32, @floatFromInt(g.height)) >= xh + @max(1.5, xh * 0.22)) {
+                    g.cp = 'l';
                     continue;
                 }
             }
@@ -2573,4 +2591,35 @@ test "dotless mono i read as '1' and a stem read as ',' inside lowercase words" 
     };
     disambiguatePhrase(&comma, 3.2, 13.0, 23.0);
     try std.testing.expectEqual(@as(u32, ','), comma[1].cp);
+}
+
+test "word-boundary solid-stem '!' and ascender-tall ',' become 'l'; real '!' is kept" {
+    // "de!" with solid stem (row_cov=1.0, h=10 > xh=7) -> "del"
+    var del_bang = [_]MatchedGlyph{
+        .{ .cp = 'd', .score = 0.96, .second_cp = 'b', .second_score = 0.6, .gap_before = 0, .width = 6, .height = 10 },
+        .{ .cp = 'e', .score = 0.97, .second_cp = 'c', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = '!', .score = 0.88, .second_cp = 'l', .second_score = 0.85, .gap_before = 1, .width = 2, .height = 10, .row_cov = 1.0 },
+    };
+    disambiguatePhrase(&del_bang, 3.3, 10.0, 20.0);
+    try std.testing.expectEqual(@as(u32, 'l'), del_bang[2].cp);
+
+    // "Hola!" with a real dot gap (row_cov=0.75) stays '!'
+    var hola = [_]MatchedGlyph{
+        .{ .cp = 'H', .score = 0.96, .second_cp = 'M', .second_score = 0.6, .gap_before = 0, .width = 7, .height = 10 },
+        .{ .cp = 'o', .score = 0.97, .second_cp = '0', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 'l', .score = 0.95, .second_cp = 'I', .second_score = 0.9, .gap_before = 1, .width = 2, .height = 10 },
+        .{ .cp = 'a', .score = 0.96, .second_cp = 'e', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = '!', .score = 0.95, .second_cp = 'l', .second_score = 0.7, .gap_before = 1, .width = 2, .height = 10, .row_cov = 0.75 },
+    };
+    disambiguatePhrase(&hola, 3.3, 10.0, 20.0);
+    try std.testing.expectEqual(@as(u32, '!'), hola[4].cp);
+
+    // "de," with ascender-tall ',' (h=10 > xh=7) -> "del"
+    var del_comma = [_]MatchedGlyph{
+        .{ .cp = 'd', .score = 0.96, .second_cp = 'b', .second_score = 0.6, .gap_before = 0, .width = 6, .height = 10 },
+        .{ .cp = 'e', .score = 0.97, .second_cp = 'c', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = ',', .score = 0.80, .second_cp = 'l', .second_score = 0.75, .gap_before = 1, .width = 2, .height = 10 },
+    };
+    disambiguatePhrase(&del_comma, 3.3, 10.0, 20.0);
+    try std.testing.expectEqual(@as(u32, 'l'), del_comma[2].cp);
 }
