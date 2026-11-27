@@ -1801,9 +1801,15 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
                         ((prev_mg.cp == '.' or prev_mg.cp == ':') and isAsciiDigit(mg.cp)) or
                         prev_mg.cp == '_' or mg.cp == '_';
                     const is_bullet = prev_mg.cp == 0x00B7 or prev_mg.cp == 0x2022 or mg.cp == 0x00B7 or mg.cp == 0x2022;
-                    const narrow_punct = !is_bullet and ((prev_mg.width <= 3 and prev_mg.height <= 8) or (mg.width <= 3 and mg.height <= 8));
+                    const prev_is_narrow_punct = !isAsciiAlpha(prev_mg.cp) and !isAsciiDigit(prev_mg.cp) and
+                        prev_mg.cp != ':' and prev_mg.cp != ',' and prev_mg.cp != ';' and
+                        prev_mg.width <= 3 and prev_mg.height <= 8;
+                    const cur_is_narrow_punct = !isAsciiAlpha(mg.cp) and !isAsciiDigit(mg.cp) and
+                        mg.width <= 3 and mg.height <= 8;
+                    const narrow_punct = !is_bullet and (prev_is_narrow_punct or cur_is_narrow_punct);
                     const narrow_digit_1 = isAsciiDigit(prev_mg.cp) and isAsciiDigit(mg.cp) and (prev_mg.cp == '1' or mg.cp == '1');
-                    const narrow_pair = !is_bullet and ((prev_mg.width <= 3 and mg.width <= 3) or (med_w >= 7.0 and (prev_mg.width <= 3 or mg.width <= 3)));
+                    const narrow_pair = (is_monospace_like or fixed_pitch) and !is_bullet and
+                        ((prev_mg.width <= 3 and mg.width <= 3) or (med_w >= 7.0 and (prev_mg.width <= 3 or mg.width <= 3)));
                     const is_ellipsis = (prev_mg.cp == '.' and mg.cp == '.');
                     const eff_space_gap = if (is_ellipsis)
                         space_gap * 2.3
