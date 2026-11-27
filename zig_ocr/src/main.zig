@@ -1701,7 +1701,9 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
             const med_w: f32 = @floatFromInt(tmp_u32.items[tmp_u32.items.len / 2]);
             const p25_w: f32 = @floatFromInt(tmp_u32.items[tmp_u32.items.len / 4]);
             const is_monospace_like = (tmp_u32.items.len >= 6 and p25_w >= med_w * 0.78);
-            var space_gap: f32 = @max(3.2, @min(med_w * 0.52, ref_h * 0.36));
+            // ref_h spans ascender to ~baseline; at 13px (ref_h ~12) 0.36 put the threshold at 4.3px
+            // and dropped real 4px word spaces (SettingsWindow, vectorand). 0.31 breaks mono 16px.
+            var space_gap: f32 = @max(3.2, @min(med_w * 0.52, ref_h * 0.33));
 
             // Monospace adaptive spacing: only when glyph widths are uniform (fixed-pitch cells
             // around narrow letters like r/t/i) scale space threshold above intra-word padding.
