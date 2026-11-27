@@ -42,6 +42,7 @@ ASSOC_NONE = 'NO_TEXT_EVIDENCE'
 DEFAULT_MIN_OBSERVED_CONF = 60.0
 TESSERACT_CONF_SCALE = 'tesseract_0_100_uncalibrated (NOT calibrated probability)'
 RAPIDOCR_CONF_SCALE = 'rapidocr_0_100_uncalibrated (raw 0..1 x100; NOT calibrated probability)'
+ZIG_CONF_SCALE = 'zig_shape_0_100_uncalibrated (SIMD cosine - geometry penalties x100; NOT calibrated probability)'
 
 # Environment variable for opt-in multilingual recognition model
 FLOWSIGHT_OCR_REC_MODEL_ENV = 'FLOWSIGHT_OCR_REC_MODEL'
@@ -428,6 +429,138 @@ def detect_tesseract_engine() -> tuple[str | None, str]:
         return tess, 'tesseract (version query failed)'
 
 
+def detect_zig_ocr_engine() -> tuple[str | None, str | None, str]:
+    """Locate the local Zig Shape OCR binary and FSOA atlas if built."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    bin_path = os.environ.get('FLOWSIGHT_ZIG_OCR_BIN') or os.path.join(
+        base_dir, 'zig_ocr', 'zig-out', 'bin', 'flowsight-ocr-zig'
+    )
+    atlas_path = os.environ.get('FLOWSIGHT_ZIG_OCR_ATLAS') or os.path.join(
+        base_dir, 'zig_ocr', 'atlas.fsoa'
+    )
+    if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK) and os.path.isfile(atlas_path):
+        return bin_path, atlas_path, 'flowsight-ocr-zig/0.1'
+    return None, None, 'absent'
+
+
+def _run_zig_ocr(
+    rgb: np.ndarray,
+    offset_x: int,
+    offset_y: int,
+    source_frame: str,
+    lang: str,
+    min_observed_conf: float,
+    timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    """Run local Zig SIMD shape OCR (`flowsight-ocr-zig`) over an RGB array."""
+    import json
+
+    t0 = time.perf_counter()
+    bin_path, atlas_path, engine_ver = detect_zig_ocr_engine()
+    if not bin_path or not atlas_path:
+        return {
+            'status': OCR_ABSENT,
+            'engine': 'none',
+            'confidence_scale': ZIG_CONF_SCALE,
+            'source_frame': source_frame,
+            'lang': lang,
+            'preprocessing': 'none',
+            'detail': 'flowsight-ocr-zig binary or atlas.fsoa absent (build via zig_ocr/)',
+            'note': 'OCR_ABSENT means text could not be read; it does NOT prove the screen has no text.',
+            'items': [],
+            'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
+    gray = Image.fromarray(rgb, mode='RGB').convert('L')
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.pgm') as tf:
+            gray.save(tf.name, format='PPM')
+            proc = subprocess.run(
+                [bin_path, '--atlas', atlas_path, '--pgm', tf.name, '--min-conf', str(min_observed_conf)],
+                capture_output=True, text=True, timeout=timeout_s,
+            )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {
+            'status': OCR_ERROR,
+            'engine': engine_ver,
+            'confidence_scale': ZIG_CONF_SCALE,
+            'source_frame': source_frame,
+            'lang': lang,
+            'preprocessing': 'grayscale_pgm_p5',
+            'detail': f'flowsight-ocr-zig execution failed: {e}',
+            'items': [],
+            'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
+    if proc.returncode != 0:
+        return {
+            'status': OCR_ERROR,
+            'engine': engine_ver,
+            'confidence_scale': ZIG_CONF_SCALE,
+            'source_frame': source_frame,
+            'lang': lang,
+            'preprocessing': 'grayscale_pgm_p5',
+            'detail': (proc.stderr or proc.stdout or 'non-zero exit').strip()[:240],
+            'items': [],
+            'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError as e:
+        return {
+            'status': OCR_ERROR,
+            'engine': engine_ver,
+            'confidence_scale': ZIG_CONF_SCALE,
+            'source_frame': source_frame,
+            'lang': lang,
+            'preprocessing': 'grayscale_pgm_p5',
+            'detail': f'invalid JSON from flowsight-ocr-zig: {e}',
+            'items': [],
+            'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
+    items: list[dict[str, Any]] = []
+    for raw_it in data.get('items', []):
+        bx = raw_it.get('bbox', [0, 0, 0, 0])
+        conf = float(raw_it.get('confidence', 0.0))
+        st = OCR_OBSERVED if conf >= min_observed_conf else OCR_UNCERTAIN
+        items.append({
+            'text': raw_it.get('text', ''),
+            'bbox': [offset_x + int(bx[0]), offset_y + int(bx[1]), offset_x + int(bx[2]), offset_y + int(bx[3])],
+            'confidence': round(conf, 1),
+            'min_word_confidence': round(float(raw_it.get('min_char_confidence', conf)), 1),
+            'confidence_scale': ZIG_CONF_SCALE,
+            'engine': engine_ver,
+            'source_frame': source_frame,
+            'status': st,
+        })
+
+    items = _order_items_column_aware(items)
+    for idx, it in enumerate(items):
+        it['id'] = f'O{idx}'
+
+    if not items:
+        overall = OCR_EMPTY
+        detail = '0 line(s) extracted; empty result does NOT prove absence of text'
+    else:
+        overall = OCR_OBSERVED if any(it['status'] == OCR_OBSERVED for it in items) else OCR_UNCERTAIN
+        detail = f'{len(items)} line(s) extracted (zig ocr_ms={data.get("ocr_ms")}); empty result does NOT prove absence of text'
+
+    return {
+        'status': overall,
+        'engine': engine_ver,
+        'confidence_scale': ZIG_CONF_SCALE,
+        'source_frame': source_frame,
+        'lang': lang,
+        'preprocessing': 'grayscale_pgm_p5',
+        'detail': detail,
+        'items': items,
+        'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        'zig_ocr_ms': data.get('ocr_ms'),
+    }
+
+
 def run_ocr(
     rgb: np.ndarray,
     offset_x: int,
@@ -461,9 +594,11 @@ def run_ocr(
     bmode = (backend or 'auto').strip().lower()
     eff_rec = rec_model_path or os.environ.get(FLOWSIGHT_OCR_REC_MODEL_ENV) or None
 
-    # Resolve effective backend before cache lookup so 'auto' and 'rapidocr'/'tesseract' share or separate cleanly
+    # Resolve effective backend before cache lookup so 'auto' and 'rapidocr'/'tesseract'/'zig' share or separate cleanly
     tess, engine_ver = detect_tesseract_engine()
-    if bmode == 'rapidocr' or (bmode == 'auto' and not tess):
+    if bmode == 'zig':
+        eff_backend = 'zig'
+    elif bmode == 'rapidocr' or (bmode == 'auto' and not tess):
         eff_backend = 'rapidocr'
     else:
         eff_backend = 'tesseract'
@@ -474,6 +609,13 @@ def run_ocr(
     if cached_res is not None:
         cached_res['source_frame'] = source_frame
         return cached_res
+
+    if eff_backend == 'zig':
+        res = _run_zig_ocr(rgb, offset_x, offset_y, source_frame, lang, min_observed_conf, timeout_s=timeout_s)
+        res['cache'] = 'MISS'
+        if res['status'] not in (OCR_ABSENT, OCR_ERROR):
+            _set_cached_ocr(rgb, offset_x, offset_y, eff_backend, lang, min_observed_conf, psm, res, eff_rec)
+        return res
 
     if eff_backend == 'rapidocr':
         if bmode == 'auto' and not detect_rapidocr_engine()[0]:
