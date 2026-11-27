@@ -196,3 +196,17 @@ def test_zig_ocr_serve_matches_oneshot_and_recovers(monkeypatch):
 
 
 
+
+
+@pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
+def test_cli_ocr_backend_flag_rewrites_ocr_filter(tmp_path, capsys):
+    """`--ocr-backend zig` must rewrite a bare `ocr` filter (regression: NameError, missing `import re`)."""
+    img = Image.new("RGB", (420, 60), (24, 24, 28))
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+    ImageDraw.Draw(img).text((12, 20), "Guardar cambios", fill=(235, 235, 235), font=font)
+    path = tmp_path / "cli.png"
+    img.save(path)
+    rc = flowsight_screen.main(["-i", str(path), "-vf", "theme,ocr", "--ocr-backend", "zig"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Guardar cambios" in out

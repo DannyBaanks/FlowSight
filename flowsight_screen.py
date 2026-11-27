@@ -20,6 +20,7 @@ import argparse
 from dataclasses import dataclass, field
 import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
