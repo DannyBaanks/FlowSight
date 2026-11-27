@@ -1146,7 +1146,8 @@ fn matchOrSplitGlyph(
             }
             const side_min = @min(lmax, rmax);
             if (side_min < 120) continue;
-            if (col_sum[sx] * 10 > side_min * 7) continue; // not a real valley
+            const valley_num: u32 = if (depth == 0 and single.score < 0.55) 85 else 70;
+            if (col_sum[sx] * 100 > side_min * valley_num) continue; // not a real valley
             // Prefer local minima
             if (col_sum[sx] > col_sum[sx - 1] or col_sum[sx] > col_sum[sx + 1]) continue;
 
