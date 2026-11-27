@@ -393,17 +393,13 @@ fn fgWorkerRun(ctx: *FgWorkerCtx) void {
     }
 }
 
-/// Compute polarity-invariant foreground strength per pixel using 16x16 tile mode background (parallel SIMD).
-fn computeForeground(
-    gpa: std.mem.Allocator,
+/// Compute polarity-invariant foreground strength per pixel into pre-allocated fg/mask buffers (parallel SIMD).
+fn computeForegroundInto(
     img: PgmImage,
-) !struct { fg: []u8, mask: []u8 } {
+    fg: []u8,
+    mask: []u8,
+) void {
     const n = @as(usize, img.width) * @as(usize, img.height);
-    const fg = try gpa.alloc(u8, n);
-    errdefer gpa.free(fg);
-    const mask = try gpa.alloc(u8, n);
-    errdefer gpa.free(mask);
-
     const tile: u32 = 16;
     const tw = (img.width + tile - 1) / tile;
     const th = (img.height + tile - 1) / tile;
@@ -429,8 +425,70 @@ fn computeForeground(
     for (threads) |maybe_t| {
         if (maybe_t) |t| t.join();
     }
+}
 
+/// Compute polarity-invariant foreground strength per pixel using 16x16 tile mode background (parallel SIMD).
+fn computeForeground(
+    gpa: std.mem.Allocator,
+    img: PgmImage,
+) !struct { fg: []u8, mask: []u8 } {
+    const n = @as(usize, img.width) * @as(usize, img.height);
+    const fg = try gpa.alloc(u8, n);
+    errdefer gpa.free(fg);
+    const mask = try gpa.alloc(u8, n);
+    errdefer gpa.free(mask);
+    computeForegroundInto(img, fg, mask);
     return .{ .fg = fg, .mask = mask };
+}
+
+const RgbToGrayCtx = struct {
+    rgb: []const u8,
+    gray: []u8,
+    n_pixels: usize,
+    next_px: std.atomic.Value(usize),
+};
+
+fn rgbToGrayWorker(ctx: *RgbToGrayCtx) void {
+    const chunk: usize = 32768;
+    const rgb = ctx.rgb;
+    const gray = ctx.gray;
+    const n = ctx.n_pixels;
+    while (true) {
+        const start = ctx.next_px.fetchAdd(chunk, .monotonic);
+        if (start >= n) break;
+        const end = @min(start + chunk, n);
+        var i = start;
+        while (i < end) : (i += 1) {
+            const off = i * 3;
+            const r: u32 = rgb[off];
+            const g: u32 = rgb[off + 1];
+            const b: u32 = rgb[off + 2];
+            // ITU-R BT.601 luma matching PIL Image.convert("L"): (0.299 R + 0.587 G + 0.114 B)
+            gray[i] = @intCast((r * 19595 + g * 38470 + b * 7471 + 32768) >> 16);
+        }
+    }
+}
+
+fn rgbToGrayParallel(rgb: []const u8, gray: []u8) void {
+    const n = gray.len;
+    var ctx = RgbToGrayCtx{
+        .rgb = rgb,
+        .gray = gray,
+        .n_pixels = n,
+        .next_px = std.atomic.Value(usize).init(0),
+    };
+    const cpu_cnt = std.Thread.getCpuCount() catch 4;
+    const n_threads: usize = if (n >= 262_144) @max(1, @min(@as(usize, 8), cpu_cnt)) else 1;
+    var threads: [8]?std.Thread = .{null} ** 8;
+    if (n_threads > 1) {
+        for (0..n_threads - 1) |ti| {
+            threads[ti] = std.Thread.spawn(.{}, rgbToGrayWorker, .{&ctx}) catch null;
+        }
+    }
+    rgbToGrayWorker(&ctx);
+    for (threads) |maybe_t| {
+        if (maybe_t) |t| t.join();
+    }
 }
 
 const Coord16 = struct { x: u16, y: u16 };
@@ -1780,6 +1838,148 @@ fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+fn writeOcrJson(
+    w: *std.Io.Writer,
+    atlas_len: usize,
+    lines: []const OcrLine,
+    min_conf: f32,
+    total_ms: f64,
+    ocr_ms: f64,
+) !void {
+    const status = if (lines.len == 0) "OCR_EMPTY" else "OCR_OBSERVED";
+    try w.print(
+        "{{\"status\":\"{s}\",\"engine\":\"flowsight-ocr-zig/0.1\",\"templates\":{d},\"elapsed_ms\":{d:.2},\"ocr_ms\":{d:.2},\"items\":[",
+        .{ status, atlas_len, total_ms, ocr_ms },
+    );
+
+    for (lines, 0..) |ln, idx| {
+        if (idx > 0) try w.writeByte(',');
+        const item_status = if (ln.mean_conf >= min_conf) "OCR_OBSERVED" else "OCR_UNCERTAIN";
+        try w.writeAll("{\"text\":");
+        try writeJsonEscaped(w, ln.text);
+        try w.print(
+            ",\"bbox\":[{d},{d},{d},{d}],\"confidence\":{d:.1},\"min_char_confidence\":{d:.1},\"status\":\"{s}\"}}",
+            .{ ln.x0, ln.y0, ln.x1, ln.y1, ln.mean_conf, ln.min_conf, item_status },
+        );
+    }
+    try w.writeAll("]}\n");
+    try w.flush();
+}
+
+/// Persistent binary frame server (`--serve`):
+/// Request header (16B LE): magic "FSQ1", width u32, height u32, channels u8 (1=gray,3=RGB), flags u8, min_conf_q8 u16.
+/// Payload: width * height * channels raw u8 bytes.
+/// Response: single NDJSON line flushed to stdout. Exits 0 cleanly on stdin EOF.
+fn runServe(gpa: std.mem.Allocator, io: std.Io, atlas: Atlas, global_profile: bool) !void {
+    var rbuf: [65536]u8 = undefined;
+    var sr = std.Io.File.stdin().reader(io, &rbuf);
+    const reader = &sr.interface;
+
+    var out_buf: [65536]u8 = undefined;
+    var fw = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &fw.interface;
+
+    // Reusable buffers across frames (zero page-faults in steady state)
+    var payload_buf: []u8 = &.{};
+    defer if (payload_buf.len > 0) gpa.free(payload_buf);
+    var gray_buf: []u8 = &.{};
+    defer if (gray_buf.len > 0) gpa.free(gray_buf);
+    var fg_buf: []u8 = &.{};
+    defer if (fg_buf.len > 0) gpa.free(fg_buf);
+    var mask_buf: []u8 = &.{};
+    defer if (mask_buf.len > 0) gpa.free(mask_buf);
+
+    while (true) {
+        var hdr: [16]u8 = undefined;
+        reader.readSliceAll(&hdr) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
+
+        const t0 = std.Io.Clock.now(.awake, io);
+
+        if (!std.mem.eql(u8, hdr[0..4], "FSQ1")) {
+            try w.writeAll("{\"status\":\"OCR_ERROR\",\"detail\":\"invalid FSQ1 frame magic\",\"items\":[]}\n");
+            try w.flush();
+            return error.InvalidFrameMagic;
+        }
+        const width = readU32Le(&hdr, 4);
+        const height = readU32Le(&hdr, 8);
+        const channels = hdr[12];
+        const flags = hdr[13];
+        const min_conf = @as(f32, @floatFromInt(readU16Le(&hdr, 14))) / 256.0;
+        const do_profile = global_profile or ((flags & 1) != 0);
+
+        if (width == 0 or height == 0 or (channels != 1 and channels != 3)) {
+            try w.writeAll("{\"status\":\"OCR_ERROR\",\"detail\":\"invalid frame dimensions or channels\",\"items\":[]}\n");
+            try w.flush();
+            return error.InvalidFrameDims;
+        }
+        const n_pixels = @as(usize, width) * @as(usize, height);
+        const payload_bytes = n_pixels * @as(usize, channels);
+        if (payload_bytes > 64 * 1024 * 1024) {
+            try w.writeAll("{\"status\":\"OCR_ERROR\",\"detail\":\"frame exceeds 64 MiB limit\",\"items\":[]}\n");
+            try w.flush();
+            return error.FrameTooLarge;
+        }
+
+        if (payload_buf.len < payload_bytes) {
+            if (payload_buf.len > 0) gpa.free(payload_buf);
+            payload_buf = try gpa.alloc(u8, payload_bytes);
+        }
+        try reader.readSliceAll(payload_buf[0..payload_bytes]);
+
+        const t_rec0 = std.Io.Clock.now(.awake, io);
+
+        const gray_slice: []const u8 = if (channels == 3) blk: {
+            if (gray_buf.len < n_pixels) {
+                if (gray_buf.len > 0) gpa.free(gray_buf);
+                gray_buf = try gpa.alloc(u8, n_pixels);
+            }
+            rgbToGrayParallel(payload_buf[0..payload_bytes], gray_buf[0..n_pixels]);
+            break :blk gray_buf[0..n_pixels];
+        } else payload_buf[0..n_pixels];
+
+        if (fg_buf.len < n_pixels) {
+            if (fg_buf.len > 0) gpa.free(fg_buf);
+            fg_buf = try gpa.alloc(u8, n_pixels);
+        }
+        if (mask_buf.len < n_pixels) {
+            if (mask_buf.len > 0) gpa.free(mask_buf);
+            mask_buf = try gpa.alloc(u8, n_pixels);
+        }
+
+        const img = PgmImage{ .width = width, .height = height, .pixels = gray_slice };
+        computeForegroundInto(img, fg_buf[0..n_pixels], mask_buf[0..n_pixels]);
+        const t_fg1 = std.Io.Clock.now(.awake, io);
+
+        var stage_timing = StageTiming{};
+        var lines = try recognizeLines(gpa, io, img, fg_buf[0..n_pixels], mask_buf[0..n_pixels], atlas, &stage_timing);
+        defer {
+            for (lines.items) |ln| gpa.free(ln.text);
+            lines.deinit(gpa);
+        }
+
+        const t1 = std.Io.Clock.now(.awake, io);
+        const total_ms = @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1_000_000.0;
+        const ocr_ms = @as(f64, @floatFromInt(t1.nanoseconds - t_rec0.nanoseconds)) / 1_000_000.0;
+
+        if (do_profile) {
+            const read_ms = @as(f64, @floatFromInt(t_rec0.nanoseconds - t0.nanoseconds)) / 1_000_000.0;
+            const fg_ms = @as(f64, @floatFromInt(t_fg1.nanoseconds - t_rec0.nanoseconds)) / 1_000_000.0;
+            var pbuf: [512]u8 = undefined;
+            var pw = std.Io.File.stderr().writer(io, &pbuf);
+            try pw.interface.print(
+                "SERVE_PROFILE read={d:.2}ms rgb+fg={d:.2}ms cc={d:.2}ms band={d:.2}ms match={d:.2}ms total={d:.2}ms\n",
+                .{ read_ms, fg_ms, stage_timing.cc_ms, stage_timing.band_ms, stage_timing.match_ms, total_ms },
+            );
+            try pw.interface.flush();
+        }
+
+        try writeOcrJson(w, atlas.meta.len, lines.items, min_conf, total_ms, ocr_ms);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -1788,6 +1988,7 @@ pub fn main(init: std.process.Init) !void {
     var pgm_path: ?[]const u8 = null;
     var min_conf: f32 = 60.0;
     var profile: bool = false;
+    var serve_mode: bool = false;
 
     var arg_it = init.minimal.args.iterate();
     defer arg_it.deinit();
@@ -1804,13 +2005,15 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--profile")) {
             profile = true;
+        } else if (std.mem.eql(u8, arg, "--serve")) {
+            serve_mode = true;
         }
     }
 
-    if (atlas_path == null or pgm_path == null) {
+    if (atlas_path == null or (!serve_mode and pgm_path == null)) {
         var ebuf: [512]u8 = undefined;
         var ew = std.Io.File.stderr().writer(io, &ebuf);
-        try ew.interface.writeAll("usage: flowsight-ocr-zig --atlas <atlas.fsoa> --pgm <image.pgm> [--min-conf 60]\n");
+        try ew.interface.writeAll("usage: flowsight-ocr-zig --atlas <atlas.fsoa> (--pgm <image.pgm|-> | --serve) [--min-conf 60] [--profile]\n");
         try ew.interface.flush();
         std.process.exit(2);
     }
@@ -1822,6 +2025,11 @@ pub fn main(init: std.process.Init) !void {
     const atlas = try loadAtlas(gpa, atlas_raw);
     defer atlas.deinit(gpa);
     const t_atlas1 = std.Io.Clock.now(.awake, io);
+
+    if (serve_mode) {
+        try runServe(gpa, io, atlas, profile);
+        return;
+    }
 
     const pgm_raw = if (std.mem.eql(u8, pgm_path.?, "-")) blk: {
         var rbuf: [65536]u8 = undefined;
@@ -1864,26 +2072,7 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [65536]u8 = undefined;
     var fw = std.Io.File.stdout().writer(io, &out_buf);
-    const w = &fw.interface;
-
-    const status = if (lines.items.len == 0) "OCR_EMPTY" else "OCR_OBSERVED";
-    try w.print(
-        "{{\"status\":\"{s}\",\"engine\":\"flowsight-ocr-zig/0.1\",\"templates\":{d},\"elapsed_ms\":{d:.2},\"ocr_ms\":{d:.2},\"items\":[",
-        .{ status, atlas.meta.len, total_ms, ocr_ms },
-    );
-
-    for (lines.items, 0..) |ln, idx| {
-        if (idx > 0) try w.writeByte(',');
-        const item_status = if (ln.mean_conf >= min_conf) "OCR_OBSERVED" else "OCR_UNCERTAIN";
-        try w.writeAll("{\"text\":");
-        try writeJsonEscaped(w, ln.text);
-        try w.print(
-            ",\"bbox\":[{d},{d},{d},{d}],\"confidence\":{d:.1},\"min_char_confidence\":{d:.1},\"status\":\"{s}\"}}",
-            .{ ln.x0, ln.y0, ln.x1, ln.y1, ln.mean_conf, ln.min_conf, item_status },
-        );
-    }
-    try w.writeAll("]}\n");
-    try w.flush();
+    try writeOcrJson(&fw.interface, atlas.meta.len, lines.items, min_conf, total_ms, ocr_ms);
 }
 
 test "parsePgm parses valid P5 header and pixels" {
@@ -1892,6 +2081,23 @@ test "parsePgm parses valid P5 header and pixels" {
     try std.testing.expectEqual(@as(u32, 2), img.width);
     try std.testing.expectEqual(@as(u32, 2), img.height);
     try std.testing.expectEqual(@as(u8, 0xff), img.pixels[1]);
+}
+
+test "rgbToGrayParallel matches BT.601 luma" {
+    const rgb = [_]u8{
+        255, 0,   0,
+        0,   255, 0,
+        0,   0,   255,
+        255, 255, 255,
+        0,   0,   0,
+    };
+    var gray: [5]u8 = undefined;
+    rgbToGrayParallel(&rgb, &gray);
+    try std.testing.expectEqual(@as(u8, 76), gray[0]);
+    try std.testing.expectEqual(@as(u8, 150), gray[1]);
+    try std.testing.expectEqual(@as(u8, 29), gray[2]);
+    try std.testing.expectEqual(@as(u8, 255), gray[3]);
+    try std.testing.expectEqual(@as(u8, 0), gray[4]);
 }
 
 test "countHolesGlyph detects 0 holes in bar and 1 hole in ring" {

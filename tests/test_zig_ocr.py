@@ -83,3 +83,42 @@ def test_zig_ocr_preserves_hyphens_underscores_and_stacked_lines():
     assert "S" not in texts[2] and "C" not in texts[2] and "V" not in texts[2]
 
 
+@pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
+def test_zig_ocr_serve_matches_oneshot_and_recovers(monkeypatch):
+    img = Image.new("RGB", (640, 120), (14, 18, 26))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+    draw.text((20, 24), "FlowSight serve mode 2026", fill=(230, 236, 245), font=font)
+    draw.text((20, 60), "¡Hola! paso 8", fill=(220, 230, 240), font=font)
+    rgb = np.asarray(img, dtype=np.uint8)
+
+    # Persistent --serve mode (bypass high-level OCR cache to exercise server directly)
+    res_serve = flowsight_ocr._run_zig_ocr(rgb, 0, 0, "serve_frame", "spa+eng", 60.0, 10.0)
+    assert res_serve["status"] == flowsight_ocr.OCR_OBSERVED
+    assert res_serve["preprocessing"] == "serve_rgb_bt601"
+    proc = flowsight_ocr._ZIG_OCR_SERVER._proc
+    assert proc is not None and proc.poll() is None
+    old_pid = proc.pid
+
+    # Kill worker and verify transparent auto-recovery
+    proc.kill()
+    proc.wait(timeout=2.0)
+    res_rec = flowsight_ocr._run_zig_ocr(rgb, 0, 0, "serve_recover", "spa+eng", 60.0, 10.0)
+    assert res_rec["status"] == flowsight_ocr.OCR_OBSERVED
+    assert res_rec["preprocessing"] == "serve_rgb_bt601"
+    assert flowsight_ocr._ZIG_OCR_SERVER._proc is not None
+    assert flowsight_ocr._ZIG_OCR_SERVER._proc.pid != old_pid
+
+    # Exact parity against one-shot PGM fallback
+    monkeypatch.setenv("FLOWSIGHT_ZIG_OCR_NO_SERVE", "1")
+    res_one = flowsight_ocr._run_zig_ocr(rgb, 0, 0, "oneshot_frame", "spa+eng", 60.0, 10.0)
+    assert res_one["preprocessing"] == "grayscale_pgm_p5"
+    assert [it["text"] for it in res_serve["items"]] == [it["text"] for it in res_one["items"]]
+    assert [it["text"] for it in res_rec["items"]] == [it["text"] for it in res_one["items"]]
+
+    # Clean shutdown leaves no child process
+    flowsight_ocr.shutdown_zig_ocr_server()
+    assert flowsight_ocr._ZIG_OCR_SERVER._proc is None
+
+
+

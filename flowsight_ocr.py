@@ -12,12 +12,16 @@ Epistemic guarantees:
 """
 from __future__ import annotations
 
+import atexit
 import copy
 import hashlib
+import json
 import math
 import os
 import re
+import select
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
@@ -443,6 +447,120 @@ def detect_zig_ocr_engine() -> tuple[str | None, str | None, str]:
     return None, None, 'absent'
 
 
+class _ZigOcrServer:
+    """Thread-safe persistent `flowsight-ocr-zig --serve` worker (zero spawn/atlas reload per frame)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._key: tuple[str, str] | None = None
+
+    def _stop_locked(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self._key = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=0.5)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._stop_locked()
+
+    def _ensure_started_locked(self, bin_path: str, atlas_path: str) -> subprocess.Popen:
+        key = (bin_path, atlas_path)
+        if self._proc is not None and self._key == key and self._proc.poll() is None:
+            return self._proc
+        self._stop_locked()
+        self._proc = subprocess.Popen(
+            [bin_path, '--atlas', atlas_path, '--serve'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=65536,
+        )
+        self._key = key
+        return self._proc
+
+    def query(
+        self,
+        bin_path: str,
+        atlas_path: str,
+        rgb: np.ndarray,
+        min_conf: float,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        arr = np.ascontiguousarray(rgb, dtype=np.uint8)
+        if arr.ndim == 2:
+            h, w = arr.shape
+            ch = 1
+        elif arr.ndim == 3 and arr.shape[2] >= 3:
+            if arr.shape[2] > 3:
+                arr = np.ascontiguousarray(arr[:, :, :3], dtype=np.uint8)
+            h, w, ch = arr.shape
+        else:
+            raise ValueError(f'Unsupported image shape for zig OCR: {arr.shape}')
+
+        min_conf_q8 = max(0, min(65535, int(round(min_conf * 256.0))))
+        hdr = struct.pack('<4sIIBBH', b'FSQ1', int(w), int(h), int(ch), 0, min_conf_q8)
+        mv = memoryview(arr).cast('B')
+
+        with self._lock:
+            last_err: Exception | None = None
+            for _attempt in range(2):
+                proc = self._ensure_started_locked(bin_path, atlas_path)
+                assert proc.stdin is not None and proc.stdout is not None
+                try:
+                    proc.stdin.write(hdr)
+                    proc.stdin.write(mv)
+                    proc.stdin.flush()
+
+                    ready, _, _ = select.select([proc.stdout], [], [], timeout_s)
+                    if not ready:
+                        self._stop_locked()
+                        raise TimeoutError(f'flowsight-ocr-zig --serve timed out after {timeout_s}s')
+
+                    line = proc.stdout.readline()
+                    if not line:
+                        self._stop_locked()
+                        raise EOFError('flowsight-ocr-zig --serve closed stdout unexpectedly')
+                    return json.loads(line.decode('utf-8', errors='replace'))
+                except (OSError, EOFError, ValueError) as e:
+                    last_err = e
+                    self._stop_locked()
+                    continue
+            assert last_err is not None
+            raise last_err
+
+
+_ZIG_OCR_SERVER = _ZigOcrServer()
+atexit.register(_ZIG_OCR_SERVER.shutdown)
+
+
+def shutdown_zig_ocr_server() -> None:
+    """Cleanly stop the persistent Zig OCR worker process (if running)."""
+    _ZIG_OCR_SERVER.shutdown()
+
+
 def _run_zig_ocr(
     rgb: np.ndarray,
     offset_x: int,
@@ -453,8 +571,6 @@ def _run_zig_ocr(
     timeout_s: float = 30.0,
 ) -> dict[str, Any]:
     """Run local Zig SIMD shape OCR (`flowsight-ocr-zig`) over an RGB array."""
-    import json
-
     t0 = time.perf_counter()
     bin_path, atlas_path, engine_ver = detect_zig_ocr_engine()
     if not bin_path or not atlas_path:
@@ -471,54 +587,78 @@ def _run_zig_ocr(
             'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
         }
 
-    gray = Image.fromarray(rgb, mode='RGB').convert('L')
-    h, w = rgb.shape[:2]
-    pgm_bytes = f'P5\n{w} {h}\n255\n'.encode('ascii') + gray.tobytes()
-    try:
-        proc = subprocess.run(
-            [bin_path, '--atlas', atlas_path, '--pgm', '-', '--min-conf', str(min_observed_conf)],
-            input=pgm_bytes,
-            capture_output=True, timeout=timeout_s,
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        return {
-            'status': OCR_ERROR,
-            'engine': engine_ver,
-            'confidence_scale': ZIG_CONF_SCALE,
-            'source_frame': source_frame,
-            'lang': lang,
-            'preprocessing': 'grayscale_pgm_p5',
-            'detail': f'flowsight-ocr-zig execution failed: {e}',
-            'items': [],
-            'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
-        }
+    preprocessing = 'serve_rgb_bt601'
+    data: dict[str, Any] | None = None
+    use_serve = os.environ.get('FLOWSIGHT_ZIG_OCR_NO_SERVE', '').strip() not in ('1', 'true', 'yes')
+    if use_serve:
+        try:
+            data = _ZIG_OCR_SERVER.query(bin_path, atlas_path, rgb, min_observed_conf, timeout_s)
+        except Exception:
+            data = None
 
-    stdout_txt = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''
-    stderr_txt = proc.stderr.decode('utf-8', errors='replace') if proc.stderr else ''
-    if proc.returncode != 0:
-        return {
-            'status': OCR_ERROR,
-            'engine': engine_ver,
-            'confidence_scale': ZIG_CONF_SCALE,
-            'source_frame': source_frame,
-            'lang': lang,
-            'preprocessing': 'grayscale_pgm_p5',
-            'detail': (stderr_txt or stdout_txt or 'non-zero exit').strip()[:240],
-            'items': [],
-            'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
-        }
+    if data is None:
+        preprocessing = 'grayscale_pgm_p5'
+        gray = Image.fromarray(rgb, mode='RGB').convert('L')
+        h, w = rgb.shape[:2]
+        pgm_bytes = f'P5\n{w} {h}\n255\n'.encode('ascii') + gray.tobytes()
+        try:
+            proc = subprocess.run(
+                [bin_path, '--atlas', atlas_path, '--pgm', '-', '--min-conf', str(min_observed_conf)],
+                input=pgm_bytes,
+                capture_output=True, timeout=timeout_s,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return {
+                'status': OCR_ERROR,
+                'engine': engine_ver,
+                'confidence_scale': ZIG_CONF_SCALE,
+                'source_frame': source_frame,
+                'lang': lang,
+                'preprocessing': preprocessing,
+                'detail': f'flowsight-ocr-zig execution failed: {e}',
+                'items': [],
+                'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+            }
 
-    try:
-        data = json.loads(stdout_txt)
-    except ValueError as e:
+        stdout_txt = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''
+        stderr_txt = proc.stderr.decode('utf-8', errors='replace') if proc.stderr else ''
+        if proc.returncode != 0:
+            return {
+                'status': OCR_ERROR,
+                'engine': engine_ver,
+                'confidence_scale': ZIG_CONF_SCALE,
+                'source_frame': source_frame,
+                'lang': lang,
+                'preprocessing': preprocessing,
+                'detail': (stderr_txt or stdout_txt or 'non-zero exit').strip()[:240],
+                'items': [],
+                'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+            }
+
+        try:
+            data = json.loads(stdout_txt)
+        except ValueError as e:
+            return {
+                'status': OCR_ERROR,
+                'engine': engine_ver,
+                'confidence_scale': ZIG_CONF_SCALE,
+                'source_frame': source_frame,
+                'lang': lang,
+                'preprocessing': preprocessing,
+                'detail': f'invalid JSON from flowsight-ocr-zig: {e}',
+                'items': [],
+                'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+            }
+
+    if data.get('status') == OCR_ERROR:
         return {
             'status': OCR_ERROR,
             'engine': engine_ver,
             'confidence_scale': ZIG_CONF_SCALE,
             'source_frame': source_frame,
             'lang': lang,
-            'preprocessing': 'grayscale_pgm_p5',
-            'detail': f'invalid JSON from flowsight-ocr-zig: {e}',
+            'preprocessing': preprocessing,
+            'detail': str(data.get('detail', 'zig OCR error'))[:240],
             'items': [],
             'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
         }
@@ -556,7 +696,7 @@ def _run_zig_ocr(
         'confidence_scale': ZIG_CONF_SCALE,
         'source_frame': source_frame,
         'lang': lang,
-        'preprocessing': 'grayscale_pgm_p5',
+        'preprocessing': preprocessing,
         'detail': detail,
         'items': items,
         'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
