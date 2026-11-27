@@ -28,10 +28,13 @@ const TemplateVec = [SIMD_I8_CHUNKS]Vec32i8;
 
 const Atlas = struct {
     meta: []TemplateMeta,
+    coarse: []Vec32i8,
     vecs: []TemplateVec,
+    has_coarse: bool,
 
     fn deinit(self: Atlas, gpa: std.mem.Allocator) void {
         gpa.free(self.meta);
+        if (self.coarse.len > 0) gpa.free(self.coarse);
         gpa.free(self.vecs);
     }
 };
@@ -111,7 +114,76 @@ fn loadAtlas(gpa: std.mem.Allocator, raw: []const u8) !Atlas {
     const gw = readU16Le(raw, 6);
     const gh = readU16Le(raw, 8);
     const count = readU32Le(raw, 12);
-    if (version != 1 or gw != GRID_W or gh != GRID_H) return error.UnsupportedAtlas;
+    if ((version != 1 and version != 2 and version != 3) or gw != GRID_W or gh != GRID_H) return error.UnsupportedAtlas;
+
+    // Fastest path: FSOA v3 is pre-sorted by aspect, SoA quantized i8 + 4x8 coarse filter.
+    if (version == 3) {
+        const meta_bytes = @as(usize, count) * 12;
+        const coarse_bytes = @as(usize, count) * 32;
+        const vecs_bytes = @as(usize, count) * GRID_LEN;
+        const expected_len = 16 + meta_bytes + coarse_bytes + vecs_bytes;
+        if (raw.len < expected_len) return error.TruncatedAtlas;
+
+        const meta = try gpa.alloc(TemplateMeta, count);
+        errdefer gpa.free(meta);
+        const coarse = try gpa.alloc(Vec32i8, count);
+        errdefer gpa.free(coarse);
+        const vecs = try gpa.alloc(TemplateVec, count);
+        errdefer gpa.free(vecs);
+
+        var pos: usize = 16;
+        for (meta) |*m| {
+            const cp = readU32Le(raw, pos);
+            const aspect_q8 = readU16Le(raw, pos + 4);
+            const y_top_q8 = readI16Le(raw, pos + 6);
+            const y_bot_q8 = readI16Le(raw, pos + 8);
+            const holes = raw[pos + 10];
+            pos += 12;
+            m.* = .{
+                .codepoint = cp,
+                .aspect = @as(f32, @floatFromInt(aspect_q8)) / 256.0,
+                .y_top = @as(f32, @floatFromInt(y_top_q8)) / 256.0,
+                .y_bot = @as(f32, @floatFromInt(y_bot_q8)) / 256.0,
+                .holes = holes,
+            };
+        }
+        @memcpy(std.mem.sliceAsBytes(coarse), raw[pos .. pos + coarse_bytes]);
+        pos += coarse_bytes;
+        @memcpy(std.mem.sliceAsBytes(vecs), raw[pos .. pos + vecs_bytes]);
+        return .{ .meta = meta, .coarse = coarse, .vecs = vecs, .has_coarse = true };
+    }
+
+    // Fast path: FSOA v2 is pre-sorted by aspect and pre-quantized to SoA i8.
+    if (version == 2) {
+        const meta_bytes = @as(usize, count) * 12;
+        const vecs_bytes = @as(usize, count) * GRID_LEN;
+        const expected_len = 16 + meta_bytes + vecs_bytes;
+        if (raw.len < expected_len) return error.TruncatedAtlas;
+
+        const meta = try gpa.alloc(TemplateMeta, count);
+        errdefer gpa.free(meta);
+        const vecs = try gpa.alloc(TemplateVec, count);
+        errdefer gpa.free(vecs);
+
+        var pos: usize = 16;
+        for (meta) |*m| {
+            const cp = readU32Le(raw, pos);
+            const aspect_q8 = readU16Le(raw, pos + 4);
+            const y_top_q8 = readI16Le(raw, pos + 6);
+            const y_bot_q8 = readI16Le(raw, pos + 8);
+            const holes = raw[pos + 10];
+            pos += 12;
+            m.* = .{
+                .codepoint = cp,
+                .aspect = @as(f32, @floatFromInt(aspect_q8)) / 256.0,
+                .y_top = @as(f32, @floatFromInt(y_top_q8)) / 256.0,
+                .y_bot = @as(f32, @floatFromInt(y_bot_q8)) / 256.0,
+                .holes = holes,
+            };
+        }
+        @memcpy(std.mem.sliceAsBytes(vecs), raw[pos .. pos + vecs_bytes]);
+        return .{ .meta = meta, .coarse = &.{}, .vecs = vecs, .has_coarse = false };
+    }
 
     const entry_bytes: usize = 12 + GRID_LEN * 4;
     const expected_len: usize = 16 + @as(usize, count) * entry_bytes;
@@ -159,7 +231,7 @@ fn loadAtlas(gpa: std.mem.Allocator, raw: []const u8) !Atlas {
         meta[i] = e.meta;
         vecs[i] = e.vec;
     }
-    return .{ .meta = meta, .vecs = vecs };
+    return .{ .meta = meta, .coarse = &.{}, .vecs = vecs, .has_coarse = false };
 }
 
 fn skipPgmWsAndComments(data: []const u8, idx: *usize) void {
@@ -202,7 +274,126 @@ fn parsePgm(data: []const u8) !PgmImage {
     };
 }
 
-/// Compute polarity-invariant foreground strength per pixel using 16x16 tile mode background.
+const FgWorkerCtx = struct {
+    img: PgmImage,
+    fg: []u8,
+    mask: []u8,
+    tw: u32,
+    th: u32,
+    next_ty: std.atomic.Value(u32),
+};
+
+fn fgWorkerRun(ctx: *FgWorkerCtx) void {
+    const tile: u32 = 16;
+    const img = ctx.img;
+    const fg = ctx.fg;
+    const mask = ctx.mask;
+    const width = img.width;
+    const height = img.height;
+    const tw = ctx.tw;
+    const th = ctx.th;
+    const Vec16u8 = @Vector(16, u8);
+    const zeros16: Vec16u8 = @splat(0);
+    const ones16: Vec16u8 = @splat(1);
+
+    while (true) {
+        const ty_start = ctx.next_ty.fetchAdd(4, .monotonic);
+        if (ty_start >= th) break;
+        const ty_end = @min(ty_start + 4, th);
+
+        var ty = ty_start;
+        while (ty < ty_end) : (ty += 1) {
+            const y_start = ty * tile;
+            const y_end = @min(y_start + tile, height);
+            const rows = y_end - y_start;
+
+            var tx: u32 = 0;
+            while (tx < tw) : (tx += 1) {
+                const x_start = tx * tile;
+                const x_end = @min(x_start + tile, width);
+                const cols = x_end - x_start;
+
+                // 16-bin histogram to find dominant background luma in tile
+                var hist_cnt: [16]u32 = .{0} ** 16;
+                var hist_sum: [16]u32 = .{0} ** 16;
+
+                var y = y_start;
+                while (y < y_end) : (y += 1) {
+                    const row_off = @as(usize, y) * @as(usize, width) + x_start;
+                    const row = img.pixels[row_off .. row_off + cols];
+                    for (row) |p| {
+                        const bin: usize = p >> 4;
+                        hist_cnt[bin] += 1;
+                        hist_sum[bin] += p;
+                    }
+                }
+
+                var best_bin: usize = 0;
+                var best_cnt: u32 = 0;
+                for (0..16) |b| {
+                    if (hist_cnt[b] > best_cnt) {
+                        best_cnt = hist_cnt[b];
+                        best_bin = b;
+                    }
+                }
+                const bg_u8: u8 = if (best_cnt > 0) @intCast(hist_sum[best_bin] / best_cnt) else 0;
+
+                if (cols == 16) {
+                    const bg_v: Vec16u8 = @splat(bg_u8);
+                    var tile_fg: [16]Vec16u8 = undefined;
+                    var max_v: Vec16u8 = zeros16;
+
+                    var ry: u32 = 0;
+                    while (ry < rows) : (ry += 1) {
+                        const row_off = @as(usize, y_start + ry) * @as(usize, width) + x_start;
+                        const pv: Vec16u8 = img.pixels[row_off..][0..16].*;
+                        const diff: Vec16u8 = @max(pv, bg_v) - @min(pv, bg_v);
+                        tile_fg[ry] = diff;
+                        max_v = @max(max_v, diff);
+                    }
+                    const tile_max_diff: u32 = @reduce(.Max, max_v);
+                    const thr: u8 = @intCast(@max(@as(u32, 36), (tile_max_diff * 30) / 100));
+                    const thr_v: Vec16u8 = @splat(thr);
+
+                    ry = 0;
+                    while (ry < rows) : (ry += 1) {
+                        const row_off = @as(usize, y_start + ry) * @as(usize, width) + x_start;
+                        const diff = tile_fg[ry];
+                        fg[row_off..][0..16].* = diff;
+                        mask[row_off..][0..16].* = @select(u8, diff >= thr_v, ones16, zeros16);
+                    }
+                } else {
+                    const bg_i: i32 = bg_u8;
+                    var tile_max_diff: u32 = 0;
+                    y = y_start;
+                    while (y < y_end) : (y += 1) {
+                        const row_off = @as(usize, y) * @as(usize, width);
+                        var x = x_start;
+                        while (x < x_end) : (x += 1) {
+                            const p: i32 = img.pixels[row_off + x];
+                            const diff: u32 = @abs(p - bg_i);
+                            const d8: u8 = @intCast(@min(diff, 255));
+                            fg[row_off + x] = d8;
+                            if (d8 > tile_max_diff) tile_max_diff = d8;
+                        }
+                    }
+
+                    const thr: u8 = @intCast(@max(@as(u32, 36), (tile_max_diff * 30) / 100));
+                    y = y_start;
+                    while (y < y_end) : (y += 1) {
+                        const row_off = @as(usize, y) * @as(usize, width);
+                        var x = x_start;
+                        while (x < x_end) : (x += 1) {
+                            mask[row_off + x] = if (fg[row_off + x] >= thr) 1 else 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compute polarity-invariant foreground strength per pixel using 16x16 tile mode background (parallel SIMD).
 fn computeForeground(
     gpa: std.mem.Allocator,
     img: PgmImage,
@@ -217,85 +408,41 @@ fn computeForeground(
     const tw = (img.width + tile - 1) / tile;
     const th = (img.height + tile - 1) / tile;
 
-    var ty: u32 = 0;
-    while (ty < th) : (ty += 1) {
-        const y_start = ty * tile;
-        const y_end = @min(y_start + tile, img.height);
-        var tx: u32 = 0;
-        while (tx < tw) : (tx += 1) {
-            const x_start = tx * tile;
-            const x_end = @min(x_start + tile, img.width);
+    var ctx = FgWorkerCtx{
+        .img = img,
+        .fg = fg,
+        .mask = mask,
+        .tw = tw,
+        .th = th,
+        .next_ty = std.atomic.Value(u32).init(0),
+    };
 
-            // 16-bin histogram to find dominant background luma in tile
-            var hist_cnt: [16]u32 = .{0} ** 16;
-            var hist_sum: [16]u32 = .{0} ** 16;
-
-            var y = y_start;
-            while (y < y_end) : (y += 1) {
-                const row_off = @as(usize, y) * @as(usize, img.width);
-                var x = x_start;
-                while (x < x_end) : (x += 1) {
-                    const p = img.pixels[row_off + x];
-                    const bin: usize = p >> 4;
-                    hist_cnt[bin] += 1;
-                    hist_sum[bin] += p;
-                }
-            }
-
-            var best_bin: usize = 0;
-            var best_cnt: u32 = 0;
-            for (0..16) |b| {
-                if (hist_cnt[b] > best_cnt) {
-                    best_cnt = hist_cnt[b];
-                    best_bin = b;
-                }
-            }
-            const bg: i32 = if (best_cnt > 0) @intCast(hist_sum[best_bin] / best_cnt) else 0;
-
-            var tile_max_diff: u32 = 0;
-            y = y_start;
-            while (y < y_end) : (y += 1) {
-                const row_off = @as(usize, y) * @as(usize, img.width);
-                var x = x_start;
-                while (x < x_end) : (x += 1) {
-                    const p: i32 = img.pixels[row_off + x];
-                    const diff: u32 = @abs(p - bg);
-                    const d8: u8 = @intCast(@min(diff, 255));
-                    fg[row_off + x] = d8;
-                    if (d8 > tile_max_diff) tile_max_diff = d8;
-                }
-            }
-
-            // Adaptive per-tile threshold: 30% of local peak contrast (floor 36) breaks AA halos
-            // between adjacent bright glyphs while preserving muted/dim placeholder text.
-            const thr: u8 = @intCast(@max(@as(u32, 36), (tile_max_diff * 30) / 100));
-            y = y_start;
-            while (y < y_end) : (y += 1) {
-                const row_off = @as(usize, y) * @as(usize, img.width);
-                var x = x_start;
-                while (x < x_end) : (x += 1) {
-                    mask[row_off + x] = if (fg[row_off + x] >= thr) 1 else 0;
-                }
-            }
+    const cpu_cnt = std.Thread.getCpuCount() catch 4;
+    const n_threads: usize = if (n >= 262_144) @max(1, @min(@min(@as(usize, 8), cpu_cnt), (th + 3) / 4)) else 1;
+    var threads: [8]?std.Thread = .{null} ** 8;
+    if (n_threads > 1) {
+        for (0..n_threads - 1) |ti| {
+            threads[ti] = std.Thread.spawn(.{}, fgWorkerRun, .{&ctx}) catch null;
         }
+    }
+    fgWorkerRun(&ctx);
+    for (threads) |maybe_t| {
+        if (maybe_t) |t| t.join();
     }
 
     return .{ .fg = fg, .mask = mask };
 }
 
-/// Extract glyph-sized 8-connected components via bounded iterative BFS.
+const Coord16 = struct { x: u16, y: u16 };
+
+/// Extract glyph-sized 8-connected components via bounded iterative BFS (in-place visited bit in mask, SIMD skip).
 fn extractComponents(
     gpa: std.mem.Allocator,
-    mask: []const u8,
+    mask: []u8,
     width: u32,
     height: u32,
 ) !std.ArrayList(Comp) {
-    const n = @as(usize, width) * @as(usize, height);
-    const visited = try gpa.alloc(u8, n);
-    defer gpa.free(visited);
-    @memset(visited, 0);
-
-    var queue = try std.ArrayList(u32).initCapacity(gpa, 4096);
+    var queue = try std.ArrayList(Coord16).initCapacity(gpa, 4096);
     defer queue.deinit(gpa);
 
     var comps = try std.ArrayList(Comp).initCapacity(gpa, 1024);
@@ -303,18 +450,31 @@ fn extractComponents(
 
     const dx = [_]i32{ -1, 0, 1, -1, 1, -1, 0, 1 };
     const dy = [_]i32{ -1, -1, -1, 0, 0, 1, 1, 1 };
+    const Vec16u8 = @Vector(16, u8);
+    const ones16: Vec16u8 = @splat(1);
 
     var y: u32 = 0;
     while (y < height) : (y += 1) {
         const row_off = @as(usize, y) * @as(usize, width);
         var x: u32 = 0;
-        while (x < width) : (x += 1) {
+        while (x < width) {
+            // Fast SIMD skip over 16 background/already-visited pixels
+            if (x + 16 <= width) {
+                const v: Vec16u8 = mask[row_off + x ..][0..16].*;
+                if (!@reduce(.Or, v == ones16)) {
+                    x += 16;
+                    continue;
+                }
+            }
             const idx = row_off + x;
-            if (mask[idx] == 0 or visited[idx] != 0) continue;
+            if (mask[idx] != 1) {
+                x += 1;
+                continue;
+            }
 
-            visited[idx] = 1;
+            mask[idx] = 2;
             queue.clearRetainingCapacity();
-            try queue.append(gpa, @intCast(idx));
+            queue.appendAssumeCapacity(.{ .x = @intCast(x), .y = @intCast(y) });
 
             var min_x = x;
             var max_x = x;
@@ -326,8 +486,8 @@ fn extractComponents(
 
             while (head < queue.items.len) : (head += 1) {
                 const cur = queue.items[head];
-                const cx: u32 = cur % width;
-                const cy_u: u32 = cur / width;
+                const cx: u32 = cur.x;
+                const cy_u: u32 = cur.y;
                 area += 1;
                 if (cx < min_x) min_x = cx;
                 if (cx > max_x) max_x = cx;
@@ -342,10 +502,10 @@ fn extractComponents(
                     const ny: u32 = @intCast(ny_i);
                     if (nx >= width or ny >= height) continue;
                     const nidx = @as(usize, ny) * @as(usize, width) + nx;
-                    if (mask[nidx] != 0 and visited[nidx] == 0) {
-                        visited[nidx] = 1;
+                    if (mask[nidx] == 1) {
+                        mask[nidx] = 2;
                         if (queue.items.len < 4096) {
-                            try queue.append(gpa, @intCast(nidx));
+                            queue.appendAssumeCapacity(.{ .x = @intCast(nx), .y = @intCast(ny) });
                         } else {
                             overflowed = true;
                         }
@@ -353,6 +513,7 @@ fn extractComponents(
                 }
             }
 
+            x += 1;
             if (overflowed) continue;
             const bw = max_x - min_x + 1;
             const bh = max_y - min_y + 1;
@@ -386,8 +547,11 @@ fn countHolesGlyph(mask: []const u8, img_w: u32, x0: u32, y0: u32, x1: u32, y1: 
 
     const pw = bw + 2;
     const ph = bh + 2;
-    var padded: [50 * 50]u8 = .{0} ** (50 * 50);
-    var vis: [50 * 50]u8 = .{0} ** (50 * 50);
+    const plen = pw * ph;
+    var padded: [50 * 50]u8 = undefined;
+    var vis: [50 * 50]u8 = undefined;
+    @memset(padded[0..plen], 0);
+    @memset(vis[0..plen], 0);
     var qx: [50 * 50]u8 = undefined;
     var qy: [50 * 50]u8 = undefined;
 
@@ -467,7 +631,12 @@ fn countHolesGlyph(mask: []const u8, img_w: u32, x0: u32, y0: u32, x1: u32, y1: 
     return holes;
 }
 
-/// Bilinear resample fg patch to 12x16, zero-mean unit-L2 normalize, and quantize to 6 SIMD Vec32i8s.
+const QueryVecs = struct {
+    fine: TemplateVec,
+    coarse: Vec32i8,
+};
+
+/// Bilinear resample fg patch to 12x16, zero-mean unit-L2 normalize, and quantize to fine (6x32) + coarse (1x32) SIMD Vec32i8s.
 fn extractGlyphVecs(
     fg: []const u8,
     img_w: u32,
@@ -475,7 +644,7 @@ fn extractGlyphVecs(
     y0: u32,
     x1: u32,
     y1: u32,
-) TemplateVec {
+) QueryVecs {
     const src_w: f32 = @floatFromInt(x1 - x0);
     const src_h: f32 = @floatFromInt(y1 - y0);
     const max_x: f32 = @max(0.0, src_w - 1.0);
@@ -484,30 +653,45 @@ fn extractGlyphVecs(
     var raw: [GRID_LEN]f32 = undefined;
     var sum: f32 = 0.0;
 
+    // Precompute horizontal bilinear coords once (GRID_W=12) instead of 16x per glyph
+    var ix0_lut: [GRID_W]u32 = undefined;
+    var ix1_lut: [GRID_W]u32 = undefined;
+    var fx_lut: [GRID_W]f32 = undefined;
+    const bw_m1 = (x1 - x0) - 1;
+    const scale_x = src_w / @as(f32, GRID_W);
+    const scale_y = src_h / @as(f32, GRID_H);
+    for (0..GRID_W) |gx| {
+        const sx = std.math.clamp((@as(f32, @floatFromInt(gx)) + 0.5) * scale_x - 0.5, 0.0, max_x);
+        const ix0: u32 = @intFromFloat(@floor(sx));
+        ix0_lut[gx] = x0 + ix0;
+        ix1_lut[gx] = x0 + @min(ix0 + 1, bw_m1);
+        fx_lut[gx] = sx - @as(f32, @floatFromInt(ix0));
+    }
+
+    const bh_m1 = (y1 - y0) - 1;
     for (0..GRID_H) |gy| {
-        var sy = (@as(f32, @floatFromInt(gy)) + 0.5) * (src_h / @as(f32, GRID_H)) - 0.5;
-        sy = std.math.clamp(sy, 0.0, max_y);
+        const sy = std.math.clamp((@as(f32, @floatFromInt(gy)) + 0.5) * scale_y - 0.5, 0.0, max_y);
         const iy0: u32 = @intFromFloat(@floor(sy));
-        const iy1: u32 = @min(iy0 + 1, (y1 - y0) - 1);
+        const iy1: u32 = @min(iy0 + 1, bh_m1);
         const fy = sy - @as(f32, @floatFromInt(iy0));
+        const one_m_fy = 1.0 - fy;
         const r0 = @as(usize, y0 + iy0) * @as(usize, img_w);
         const r1 = @as(usize, y0 + iy1) * @as(usize, img_w);
 
         for (0..GRID_W) |gx| {
-            var sx = (@as(f32, @floatFromInt(gx)) + 0.5) * (src_w / @as(f32, GRID_W)) - 0.5;
-            sx = std.math.clamp(sx, 0.0, max_x);
-            const ix0: u32 = @intFromFloat(@floor(sx));
-            const ix1: u32 = @min(ix0 + 1, (x1 - x0) - 1);
-            const fx = sx - @as(f32, @floatFromInt(ix0));
+            const c0 = ix0_lut[gx];
+            const c1 = ix1_lut[gx];
+            const fx = fx_lut[gx];
+            const one_m_fx = 1.0 - fx;
 
-            const v00: f32 = @floatFromInt(fg[r0 + x0 + ix0]);
-            const v01: f32 = @floatFromInt(fg[r0 + x0 + ix1]);
-            const v10: f32 = @floatFromInt(fg[r1 + x0 + ix0]);
-            const v11: f32 = @floatFromInt(fg[r1 + x0 + ix1]);
+            const v00: f32 = @floatFromInt(fg[r0 + c0]);
+            const v01: f32 = @floatFromInt(fg[r0 + c1]);
+            const v10: f32 = @floatFromInt(fg[r1 + c0]);
+            const v11: f32 = @floatFromInt(fg[r1 + c1]);
 
-            const top = v00 * (1.0 - fx) + v01 * fx;
-            const bot = v10 * (1.0 - fx) + v11 * fx;
-            const val = (top * (1.0 - fy) + bot * fy) / 255.0;
+            const top = v00 * one_m_fx + v01 * fx;
+            const bot = v10 * one_m_fx + v11 * fx;
+            const val = (top * one_m_fy + bot * fy) * (1.0 / 255.0);
             raw[gy * GRID_W + gx] = val;
             sum += val;
         }
@@ -520,15 +704,42 @@ fn extractGlyphVecs(
         sq_sum += raw[i] * raw[i];
     }
     const inv_norm: f32 = if (sq_sum > 1e-10) 1.0 / @sqrt(sq_sum) else 0.0;
-    var out: TemplateVec = undefined;
+    var out_fine: TemplateVec = undefined;
     for (0..SIMD_I8_CHUNKS) |chunk| {
         var arr: [32]i8 = undefined;
         for (0..32) |k| {
             arr[k] = quantizeF32ToI8(raw[chunk * 32 + k] * inv_norm);
         }
-        out[chunk] = arr;
+        out_fine[chunk] = arr;
     }
-    return out;
+
+    // 4x8 coarse descriptor (3x2 block average of 12x16 zero-mean grid)
+    var coarse_f: [32]f32 = undefined;
+    var c_sum: f32 = 0.0;
+    for (0..8) |cy| {
+        const r0 = (cy * 2) * GRID_W;
+        const r1 = (cy * 2 + 1) * GRID_W;
+        for (0..4) |cx| {
+            const c0 = cx * 3;
+            const v = (raw[r0 + c0] + raw[r0 + c0 + 1] + raw[r0 + c0 + 2] +
+                raw[r1 + c0] + raw[r1 + c0 + 1] + raw[r1 + c0 + 2]) * (1.0 / 6.0);
+            coarse_f[cy * 4 + cx] = v;
+            c_sum += v;
+        }
+    }
+    const c_mean = c_sum * (1.0 / 32.0);
+    var c_sq: f32 = 0.0;
+    for (0..32) |i| {
+        coarse_f[i] -= c_mean;
+        c_sq += coarse_f[i] * coarse_f[i];
+    }
+    const c_inv: f32 = if (c_sq > 1e-10) 1.0 / @sqrt(c_sq) else 0.0;
+    var c_arr: [32]i8 = undefined;
+    for (0..32) |i| {
+        c_arr[i] = quantizeF32ToI8(coarse_f[i] * c_inv);
+    }
+
+    return .{ .fine = out_fine, .coarse = c_arr };
 }
 
 const MatchResult = struct {
@@ -551,62 +762,126 @@ const MatchedGlyph = struct {
 };
 
 inline fn dotI8Simd(q: *const TemplateVec, t: *const TemplateVec) f32 {
+    // Accumulate pairs of chunks in i16 (max |2 * 127 * 127| = 32258 < 32767, overflow-free),
+    // then widen to i32 only 3 times instead of 6.
     var acc: Vec32i32 = @splat(0);
-    inline for (0..SIMD_I8_CHUNKS) |c| {
-        const qa: Vec32i16 = q[c];
-        const tb: Vec32i16 = t[c];
-        const prod: Vec32i16 = qa * tb;
-        acc += prod;
+    inline for (0..SIMD_I8_CHUNKS / 2) |pair| {
+        const qa0: Vec32i16 = q[pair * 2];
+        const tb0: Vec32i16 = t[pair * 2];
+        const qa1: Vec32i16 = q[pair * 2 + 1];
+        const tb1: Vec32i16 = t[pair * 2 + 1];
+        const sum16: Vec32i16 = (qa0 * tb0) + (qa1 * tb1);
+        acc += sum16;
     }
     const sum: i32 = @reduce(.Add, acc);
     return @as(f32, @floatFromInt(sum)) * INV_QUANT_SQ;
 }
 
-/// Hot-path SoA i8 SIMD shape matcher returning top-2 distinct codepoints (aspect-indexed).
+inline fn dotCoarseI8Simd(q: Vec32i8, t: Vec32i8) f32 {
+    const qa: Vec32i16 = q;
+    const tb: Vec32i16 = t;
+    const prod: Vec32i16 = qa * tb;
+    const acc: Vec32i32 = prod;
+    const sum: i32 = @reduce(.Add, acc);
+    return @as(f32, @floatFromInt(sum)) * INV_QUANT_SQ;
+}
+
+/// Hot-path SoA i8 SIMD shape matcher returning top-2 distinct codepoints (aspect-indexed + 4x8 coarse filter).
 fn matchGlyphSimd(
     atlas: Atlas,
-    q_vecs: *const TemplateVec,
+    q: *const QueryVecs,
     q_aspect: f32,
     q_y_top: f32,
     q_y_bot: f32,
     q_holes: u8,
 ) MatchResult {
     const meta = atlas.meta;
+    const coarse = atlas.coarse;
     const vecs = atlas.vecs;
+    const use_coarse = atlas.has_coarse;
+    const q_coarse = q.coarse;
+    const q_vecs = &q.fine;
     const aspect_win: f32 = 0.35;
-    const min_aspect = q_aspect - aspect_win;
-    const max_aspect = q_aspect + aspect_win;
 
-    // Binary search for first template with meta[lo].aspect >= min_aspect
+    // Binary search for center template near q_aspect so best_score/second_score warm up immediately
+    // and coarse/upper-bound pruning rejects distant templates early.
     var lo: usize = 0;
     var hi: usize = meta.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (meta[mid].aspect < min_aspect) {
+        if (meta[mid].aspect < q_aspect) {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
+    const center = lo;
 
     var best_cp: u32 = '?';
     var best_score: f32 = -10.0;
     var second_cp: u32 = '?';
     var second_score: f32 = -10.0;
 
-    var idx = lo;
+    // Scan upward from center to max_aspect
+    var idx = center;
     while (idx < meta.len) : (idx += 1) {
         const m = meta[idx];
-        if (m.aspect > max_aspect) break;
+        const aspect_diff = m.aspect - q_aspect;
+        if (aspect_diff > aspect_win) break;
+        if (1.05 - 0.22 * aspect_diff <= second_score and 1.05 - 0.22 * aspect_diff <= best_score) break;
 
-        // Pre-SIMD vertical reject over compact 16B metadata array (stays in L1/L2)
         const y_diff = (@abs(q_y_top - m.y_top) + @abs(q_y_bot - m.y_bot)) * 0.5;
         if (y_diff > 0.85) continue;
 
-        const aspect_diff = @abs(q_aspect - m.aspect);
-        const dot = dotI8Simd(q_vecs, &vecs[idx]);
         const hole_pen: f32 = if (q_holes == m.holes) 0.0 else 0.10;
-        const score = dot - 0.22 * aspect_diff - 0.28 * @min(y_diff, 1.5) - hole_pen;
+        const penalty = 0.22 * aspect_diff + 0.28 * @min(y_diff, 1.5) + hole_pen;
+        const cutoff = if (m.codepoint == best_cp) best_score else second_score;
+        if (1.05 - penalty <= cutoff) continue;
+
+        if (use_coarse and cutoff > 0.35) {
+            const cdot = dotCoarseI8Simd(q_coarse, coarse[idx]);
+            if (cdot - penalty < cutoff - 0.16) continue;
+        }
+
+        const dot = dotI8Simd(q_vecs, &vecs[idx]);
+        const score = dot - penalty;
+        if (score > best_score) {
+            if (m.codepoint != best_cp) {
+                second_score = best_score;
+                second_cp = best_cp;
+            }
+            best_score = score;
+            best_cp = m.codepoint;
+        } else if (m.codepoint != best_cp and score > second_score) {
+            second_score = score;
+            second_cp = m.codepoint;
+        }
+    }
+
+    // Scan downward from center - 1 to min_aspect
+    var rev = center;
+    while (rev > 0) {
+        rev -= 1;
+        const m = meta[rev];
+        const aspect_diff = q_aspect - m.aspect;
+        if (aspect_diff > aspect_win) break;
+        if (1.05 - 0.22 * aspect_diff <= second_score and 1.05 - 0.22 * aspect_diff <= best_score) break;
+
+        const y_diff = (@abs(q_y_top - m.y_top) + @abs(q_y_bot - m.y_bot)) * 0.5;
+        if (y_diff > 0.85) continue;
+
+        const hole_pen: f32 = if (q_holes == m.holes) 0.0 else 0.10;
+        const penalty = 0.22 * aspect_diff + 0.28 * @min(y_diff, 1.5) + hole_pen;
+        const cutoff = if (m.codepoint == best_cp) best_score else second_score;
+        if (1.05 - penalty <= cutoff) continue;
+
+        if (use_coarse and cutoff > 0.35) {
+            const cdot = dotCoarseI8Simd(q_coarse, coarse[rev]);
+            if (cdot - penalty < cutoff - 0.16) continue;
+        }
+
+        const dot = dotI8Simd(q_vecs, &vecs[rev]);
+        const score = dot - penalty;
         if (score > best_score) {
             if (m.codepoint != best_cp) {
                 second_score = best_score;
@@ -1032,8 +1307,9 @@ const BandWorkerCtx = struct {
     atlas: Atlas,
     comps: []const Comp,
     bands: []const Band,
+    band_order: []const usize,
     band_outs: []std.ArrayList(OcrLine),
-    next_band: std.atomic.Value(usize),
+    next_task: std.atomic.Value(usize),
 };
 
 fn bandWorkerRun(ctx: *BandWorkerCtx) void {
@@ -1054,8 +1330,9 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
     defer matched.deinit(gpa);
 
     while (true) {
-        const bi = ctx.next_band.fetchAdd(1, .monotonic);
-        if (bi >= ctx.bands.len) break;
+        const ti = ctx.next_task.fetchAdd(1, .monotonic);
+        if (ti >= ctx.band_order.len) break;
+        const bi = ctx.band_order[ti];
         const b = ctx.bands[bi];
         if (b.merged or b.indices.items.len == 0) continue;
 
@@ -1250,15 +1527,26 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
 }
 
 /// Group components into horizontal text phrases, merge vertical diacritics, match shapes in parallel.
+const StageTiming = struct {
+    cc_ms: f64 = 0,
+    band_ms: f64 = 0,
+    match_ms: f64 = 0,
+};
+
 fn recognizeLines(
     gpa: std.mem.Allocator,
+    io: std.Io,
     img: PgmImage,
     fg: []const u8,
-    mask: []const u8,
+    mask: []u8,
     atlas: Atlas,
+    timing: *StageTiming,
 ) !std.ArrayList(OcrLine) {
+    const t_cc0 = std.Io.Clock.now(.awake, io);
     var comps = try extractComponents(gpa, mask, img.width, img.height);
     defer comps.deinit(gpa);
+    const t_cc1 = std.Io.Clock.now(.awake, io);
+    timing.cc_ms = @as(f64, @floatFromInt(t_cc1.nanoseconds - t_cc0.nanoseconds)) / 1_000_000.0;
 
     var lines_out = try std.ArrayList(OcrLine).initCapacity(gpa, 128);
     errdefer {
@@ -1405,12 +1693,33 @@ fn recognizeLines(
         }
     }
 
+    const t_m0 = std.Io.Clock.now(.awake, io);
+    timing.band_ms = @as(f64, @floatFromInt(t_m0.nanoseconds - t_cc1.nanoseconds)) / 1_000_000.0;
+
     const band_outs = try gpa.alloc(std.ArrayList(OcrLine), bands.items.len);
     for (band_outs) |*bo| bo.* = .empty;
     defer {
         for (band_outs) |*bo| bo.deinit(gpa);
         gpa.free(band_outs);
     }
+
+    // LPT scheduling: dispatch densest bands first to eliminate tail-latency stragglers
+    const band_order = try gpa.alloc(usize, bands.items.len);
+    defer gpa.free(band_order);
+    var active_cnt: usize = 0;
+    for (bands.items, 0..) |b, bi| {
+        if (!b.merged and b.indices.items.len > 0) {
+            band_order[active_cnt] = bi;
+            active_cnt += 1;
+        }
+    }
+    const SortBandCtx = struct {
+        bands: []const Band,
+        pub fn less(self: @This(), a: usize, b: usize) bool {
+            return self.bands[a].indices.items.len > self.bands[b].indices.items.len;
+        }
+    };
+    std.mem.sort(usize, band_order[0..active_cnt], SortBandCtx{ .bands = bands.items }, SortBandCtx.less);
 
     var ctx = BandWorkerCtx{
         .gpa = gpa,
@@ -1420,13 +1729,14 @@ fn recognizeLines(
         .atlas = atlas,
         .comps = comps.items,
         .bands = bands.items,
+        .band_order = band_order[0..active_cnt],
         .band_outs = band_outs,
-        .next_band = std.atomic.Value(usize).init(0),
+        .next_task = std.atomic.Value(usize).init(0),
     };
 
     const cpu_cnt = std.Thread.getCpuCount() catch 4;
-    const n_threads: usize = @max(1, @min(@min(@as(usize, 6), cpu_cnt), bands.items.len));
-    var threads: [6]?std.Thread = .{null} ** 6;
+    const n_threads: usize = @max(1, @min(@min(@as(usize, 12), cpu_cnt), bands.items.len));
+    var threads: [12]?std.Thread = .{null} ** 12;
     if (n_threads > 1) {
         for (0..n_threads - 1) |ti| {
             threads[ti] = std.Thread.spawn(.{}, bandWorkerRun, .{&ctx}) catch null;
@@ -1442,6 +1752,9 @@ fn recognizeLines(
     for (band_outs) |*bo| {
         try lines_out.appendSlice(gpa, bo.items);
     }
+
+    const t_m1 = std.Io.Clock.now(.awake, io);
+    timing.match_ms = @as(f64, @floatFromInt(t_m1.nanoseconds - t_m0.nanoseconds)) / 1_000_000.0;
 
     return lines_out;
 }
@@ -1474,6 +1787,7 @@ pub fn main(init: std.process.Init) !void {
     var atlas_path: ?[]const u8 = null;
     var pgm_path: ?[]const u8 = null;
     var min_conf: f32 = 60.0;
+    var profile: bool = false;
 
     var arg_it = init.minimal.args.iterate();
     defer arg_it.deinit();
@@ -1488,6 +1802,8 @@ pub fn main(init: std.process.Init) !void {
             if (arg_it.next()) |v| {
                 min_conf = std.fmt.parseFloat(f32, v) catch 60.0;
             }
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            profile = true;
         }
     }
 
@@ -1505,6 +1821,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(atlas_raw);
     const atlas = try loadAtlas(gpa, atlas_raw);
     defer atlas.deinit(gpa);
+    const t_atlas1 = std.Io.Clock.now(.awake, io);
 
     const pgm_raw = if (std.mem.eql(u8, pgm_path.?, "-")) blk: {
         var rbuf: [65536]u8 = undefined;
@@ -1519,8 +1836,10 @@ pub fn main(init: std.process.Init) !void {
     const fg_res = try computeForeground(gpa, img);
     defer gpa.free(fg_res.fg);
     defer gpa.free(fg_res.mask);
+    const t_fg1 = std.Io.Clock.now(.awake, io);
 
-    var lines = try recognizeLines(gpa, img, fg_res.fg, fg_res.mask, atlas);
+    var stage_timing = StageTiming{};
+    var lines = try recognizeLines(gpa, io, img, fg_res.fg, fg_res.mask, atlas, &stage_timing);
     defer {
         for (lines.items) |ln| gpa.free(ln.text);
         lines.deinit(gpa);
@@ -1529,6 +1848,19 @@ pub fn main(init: std.process.Init) !void {
     const t1 = std.Io.Clock.now(.awake, io);
     const total_ms = @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1_000_000.0;
     const ocr_ms = @as(f64, @floatFromInt(t1.nanoseconds - t_rec0.nanoseconds)) / 1_000_000.0;
+
+    if (profile) {
+        const atlas_ms = @as(f64, @floatFromInt(t_atlas1.nanoseconds - t0.nanoseconds)) / 1_000_000.0;
+        const pgm_ms = @as(f64, @floatFromInt(t_rec0.nanoseconds - t_atlas1.nanoseconds)) / 1_000_000.0;
+        const fg_ms = @as(f64, @floatFromInt(t_fg1.nanoseconds - t_rec0.nanoseconds)) / 1_000_000.0;
+        var pbuf: [512]u8 = undefined;
+        var pw = std.Io.File.stderr().writer(io, &pbuf);
+        try pw.interface.print(
+            "PROFILE atlas={d:.2}ms pgm={d:.2}ms fg={d:.2}ms cc={d:.2}ms band={d:.2}ms match={d:.2}ms total={d:.2}ms\n",
+            .{ atlas_ms, pgm_ms, fg_ms, stage_timing.cc_ms, stage_timing.band_ms, stage_timing.match_ms, total_ms },
+        );
+        try pw.interface.flush();
+    }
 
     var out_buf: [65536]u8 = undefined;
     var fw = std.Io.File.stdout().writer(io, &out_buf);

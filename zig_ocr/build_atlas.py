@@ -208,20 +208,21 @@ def build_atlas(out_path: Path) -> None:
     for cp in sorted(by_cp.keys()):
         templates.extend(by_cp[cp])
 
-    # Binary format FSOA v1 (little-endian):
-    # Header (16 bytes): magic "FSOA", version u16=1, grid_w u16=12, grid_h u16=16,
+    # Pre-sort by aspect_q8 ascending so Zig runtime needs zero sorting on load.
+    templates.sort(key=lambda t: (t["aspect_q8"], t["codepoint"]))
+
+    # Binary format FSOA v3 (little-endian, pre-sorted by aspect, SoA quantized i8 + 4x8 coarse):
+    # Header (16 bytes): magic "FSOA", version u16=3, grid_w u16=12, grid_h u16=16,
     #                    reserved u16=0, count u32
-    # Each entry (12 + 192*4 = 780 bytes):
-    #   codepoint: u32
-    #   aspect_q8: u16
-    #   y_top_q8:  i16
-    #   y_bot_q8:  i16
-    #   holes:     u8
-    #   pad:       u8
-    #   vec:       192 * f32 (zero-mean unit-L2)
+    # Section 1 — Meta SoA (count * 12 bytes):
+    #   codepoint: u32, aspect_q8: u16, y_top_q8: i16, y_bot_q8: i16, holes: u8, pad: u8
+    # Section 2 — Coarse 4x8 SoA (count * 32 bytes):
+    #   32 * i8 (3x2 block-averaged from 12x16, zero-mean unit-L2, quantized * 256)
+    # Section 3 — Fine 12x16 SoA (count * 192 bytes):
+    #   192 * i8 quantized as round(clamp(v * 256.0, -127.0, 127.0))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
-        f.write(struct.pack("<4sHHHHI", b"FSOA", 1, GRID_W, GRID_H, 0, len(templates)))
+        f.write(struct.pack("<4sHHHHI", b"FSOA", 3, GRID_W, GRID_H, 0, len(templates)))
         for t in templates:
             f.write(
                 struct.pack(
@@ -234,7 +235,18 @@ def build_atlas(out_path: Path) -> None:
                     0,
                 )
             )
-            f.write(t["vec"].astype("<f4").tobytes())
+        for t in templates:
+            g = t["vec"].reshape(GRID_H, GRID_W)
+            coarse = g.reshape(8, 2, 4, 3).mean(axis=(1, 3)).reshape(-1)
+            coarse = coarse - float(np.mean(coarse))
+            cnorm = float(np.linalg.norm(coarse))
+            if cnorm > 1e-6:
+                coarse = coarse / cnorm
+            qc = np.round(np.clip(coarse * 256.0, -127.0, 127.0)).astype(np.int8)
+            f.write(qc.tobytes())
+        for t in templates:
+            q = np.round(np.clip(t["vec"] * 256.0, -127.0, 127.0)).astype(np.int8)
+            f.write(q.tobytes())
 
     size_kb = out_path.stat().st_size / 1024.0
     print(
