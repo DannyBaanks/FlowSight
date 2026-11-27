@@ -1367,6 +1367,30 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
             }
         }
 
+        // 0d) A bare stem ('l', 'I', '|') no taller than the phrase x-height is an 'i' whose dot was
+        //     lost (1px dots at 12-14px fall below the component area floor): 'l' and 'I' reach the
+        //     ascender/cap line. Liberation/Noto/Nimbus: Slstema, palrs, Orlgen.
+        if ((g.cp == 'l' or g.cp == 'I' or g.cp == '|') and near_alpha and g.width <= 3) {
+            if (phrase_xh) |xh| {
+                if (xh >= 5.0 and @as(f32, @floatFromInt(g.height)) <= xh + 0.5) {
+                    g.cp = 'i';
+                    continue;
+                }
+            }
+        }
+
+        // 0e) Word-initial 'I' followed by a lowercase vowel is an 'l' (Iocalhost, Iado): English and
+        //     Spanish words starting with I take a consonant next (In, Is, It, Idioma, Importar).
+        if (g.cp == 'I' and !has_left and has_right and !near_digit) {
+            switch (right_cp) {
+                'a', 'e', 'o', 'u' => {
+                    g.cp = 'l';
+                    continue;
+                },
+                else => {},
+            }
+        }
+
         // 1) 'O' or 'o' inside a numeric token (e.g., 2O26, 11:O1) -> '0'
         if ((g.cp == 'O' or g.cp == 'o') and (near_digit or ((left_cp == ':' or right_cp == ':') and !near_alpha))) {
             if (g.second_cp == '0' or (g.score - g.second_score < 0.25)) {
@@ -2445,4 +2469,39 @@ test "16px colon whose runner-up is 'i' stays ':' when its rows have a gap" {
     };
     disambiguatePhrase(&kv, 3.6, 10.0, 21.0);
     try std.testing.expectEqual(@as(u32, ':'), kv[2].cp);
+}
+
+test "x-height stem without its dot is 'i'; ascender-height 'l' is kept; word-initial Io -> lo" {
+    // Liberation 13px "pairs": the 1px i-dot is dropped, the stem (h=7 = x-height) matched 'l'.
+    var pairs = [_]MatchedGlyph{
+        .{ .cp = 'p', .score = 0.97, .second_cp = 'P', .second_score = 0.8, .gap_before = 0, .width = 6, .height = 10 },
+        .{ .cp = 'a', .score = 0.92, .second_cp = 'e', .second_score = 0.6, .gap_before = 0, .width = 7, .height = 7 },
+        .{ .cp = 'l', .score = 0.90, .second_cp = '\'', .second_score = 0.78, .gap_before = 1, .width = 1, .height = 7 },
+        .{ .cp = 'r', .score = 0.96, .second_cp = 'F', .second_score = 0.75, .gap_before = 2, .width = 3, .height = 7 },
+        .{ .cp = 's', .score = 0.96, .second_cp = 'S', .second_score = 0.9, .gap_before = 0, .width = 6, .height = 7 },
+    };
+    disambiguatePhrase(&pairs, 3.6, 12.0, 22.0);
+    try std.testing.expectEqual(@as(u32, 'i'), pairs[2].cp);
+
+    // "localhost": word-initial stem is full height (I/l ambiguous) -> 'l' before a vowel; the
+    // inner 'l' (h=10) stays 'l'.
+    var lh = [_]MatchedGlyph{
+        .{ .cp = 'I', .score = 0.94, .second_cp = 'l', .second_score = 0.94, .gap_before = 0, .width = 1, .height = 10 },
+        .{ .cp = 'o', .score = 0.97, .second_cp = 'O', .second_score = 0.89, .gap_before = 1, .width = 7, .height = 7 },
+        .{ .cp = 'c', .score = 0.99, .second_cp = 'C', .second_score = 0.96, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 'a', .score = 0.92, .second_cp = 'e', .second_score = 0.63, .gap_before = 0, .width = 7, .height = 7 },
+        .{ .cp = 'l', .score = 0.94, .second_cp = 'I', .second_score = 0.94, .gap_before = 1, .width = 1, .height = 10 },
+        .{ .cp = 'h', .score = 0.97, .second_cp = 'H', .second_score = 0.76, .gap_before = 2, .width = 6, .height = 10 },
+    };
+    disambiguatePhrase(&lh, 3.6, 12.0, 22.0);
+    try std.testing.expectEqual(@as(u32, 'l'), lh[0].cp);
+    try std.testing.expectEqual(@as(u32, 'l'), lh[4].cp);
+
+    // "Is": word-initial I before a consonant stays 'I'.
+    var is = [_]MatchedGlyph{
+        .{ .cp = 'I', .score = 0.94, .second_cp = 'l', .second_score = 0.94, .gap_before = 0, .width = 1, .height = 10 },
+        .{ .cp = 's', .score = 0.96, .second_cp = 'S', .second_score = 0.9, .gap_before = 1, .width = 6, .height = 7 },
+    };
+    disambiguatePhrase(&is, 3.6, 12.0, 22.0);
+    try std.testing.expectEqual(@as(u32, 'I'), is[0].cp);
 }
