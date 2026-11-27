@@ -1370,10 +1370,23 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
         // 0d) A bare stem ('l', 'I', '|') no taller than the phrase x-height is an 'i' whose dot was
         //     lost (1px dots at 12-14px fall below the component area floor): 'l' and 'I' reach the
         //     ascender/cap line. Liberation/Noto/Nimbus: Slstema, palrs, Orlgen.
-        if ((g.cp == 'l' or g.cp == 'I' or g.cp == '|') and near_alpha and g.width <= 3) {
+        const bare_stem = g.cp == 'l' or g.cp == 'I' or g.cp == '|' or (g.cp == '1' and near_lower and !near_digit);
+        if (bare_stem and near_alpha and g.width <= 6) {
             if (phrase_xh) |xh| {
                 if (xh >= 5.0 and @as(f32, @floatFromInt(g.height)) <= xh + 0.5) {
                     g.cp = 'i';
+                    continue;
+                }
+            }
+        }
+
+        // 0d') ',' or '.' wedged between two lowercase letters with no space after it and at least
+        //      x-height tall is a stem that lost its top (light-on-dark AA, Noto: Va,or, loca,host).
+        if ((g.cp == ',' or g.cp == '.') and has_left and has_right and isAsciiLower(left_cp) and isAsciiLower(right_cp)) {
+            if (phrase_xh) |xh| {
+                const h: f32 = @floatFromInt(g.height);
+                if (xh >= 5.0 and h >= xh - 0.5) {
+                    g.cp = if (h >= xh + @max(1.5, xh * 0.22)) 'l' else 'i';
                     continue;
                 }
             }
@@ -2504,4 +2517,37 @@ test "x-height stem without its dot is 'i'; ascender-height 'l' is kept; word-in
     };
     disambiguatePhrase(&is, 3.6, 12.0, 22.0);
     try std.testing.expectEqual(@as(u32, 'I'), is[0].cp);
+}
+
+test "dotless mono i read as '1' and a stem read as ',' inside lowercase words" {
+    // DejaVu Sans Mono 12px "pairs": the serifed i without its dot matched '1' (w=6, h=7 = x-height).
+    var pairs = [_]MatchedGlyph{
+        .{ .cp = 'p', .score = 0.96, .second_cp = 'P', .second_score = 0.8, .gap_before = 0, .width = 6, .height = 10 },
+        .{ .cp = 'a', .score = 0.97, .second_cp = '8', .second_score = 0.56, .gap_before = 1, .width = 5, .height = 7 },
+        .{ .cp = '1', .score = 0.89, .second_cp = 'l', .second_score = 0.88, .gap_before = 2, .width = 6, .height = 7 },
+        .{ .cp = 'r', .score = 0.97, .second_cp = 'F', .second_score = 0.8, .gap_before = 3, .width = 5, .height = 7 },
+        .{ .cp = 's', .score = 0.99, .second_cp = 'S', .second_score = 0.86, .gap_before = 1, .width = 5, .height = 7 },
+    };
+    disambiguatePhrase(&pairs, 4.3, 13.0, 22.0);
+    try std.testing.expectEqual(@as(u32, 'i'), pairs[2].cp);
+
+    // Noto 12px light "Valor": the full-height l matched ',' (h=10 > x-height 7) -> 'l'.
+    var valor = [_]MatchedGlyph{
+        .{ .cp = 'V', .score = 0.95, .second_cp = 'v', .second_score = 0.94, .gap_before = 0, .width = 7, .height = 9 },
+        .{ .cp = 'a', .score = 0.99, .second_cp = '0', .second_score = 0.64, .gap_before = 0, .width = 6, .height = 7 },
+        .{ .cp = ',', .score = 0.78, .second_cp = '\'', .second_score = 0.68, .gap_before = 2, .width = 1, .height = 10 },
+        .{ .cp = 'o', .score = 0.98, .second_cp = 'O', .second_score = 0.89, .gap_before = 1, .width = 7, .height = 7 },
+        .{ .cp = 'r', .score = 0.98, .second_cp = 'F', .second_score = 0.77, .gap_before = 1, .width = 4, .height = 7 },
+    };
+    disambiguatePhrase(&valor, 3.2, 13.0, 23.0);
+    try std.testing.expectEqual(@as(u32, 'l'), valor[2].cp);
+
+    // "a, b" keeps a real comma: there is a space after it.
+    var comma = [_]MatchedGlyph{
+        .{ .cp = 'a', .score = 0.99, .second_cp = '0', .second_score = 0.64, .gap_before = 0, .width = 6, .height = 7 },
+        .{ .cp = ',', .score = 0.9, .second_cp = '\'', .second_score = 0.68, .gap_before = 1, .width = 2, .height = 4 },
+        .{ .cp = 'b', .score = 0.98, .second_cp = 'h', .second_score = 0.8, .gap_before = 6, .width = 6, .height = 10 },
+    };
+    disambiguatePhrase(&comma, 3.2, 13.0, 23.0);
+    try std.testing.expectEqual(@as(u32, ','), comma[1].cp);
 }
