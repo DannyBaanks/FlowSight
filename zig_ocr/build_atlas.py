@@ -48,7 +48,7 @@ CANDIDATE_FONTS = [
     "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
 ]
 
-FONT_SIZES = [11, 13, 15, 18]
+FONT_SIZES = [11, 12, 13, 14, 15, 16, 18]
 
 
 def count_holes(mask: np.ndarray) -> int:

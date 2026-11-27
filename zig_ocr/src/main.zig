@@ -338,6 +338,20 @@ fn fgWorkerRun(ctx: *FgWorkerCtx) void {
                 }
                 const bg_u8: u8 = if (best_cnt > 0) @intCast(hist_sum[best_bin] / best_cnt) else 0;
 
+                // Background coherence gate: real text over solid/gradient UI backgrounds concentrates
+                // >=35% of tile pixels in the single dominant histogram bin (width 16 luma);
+                // uniform RGB random noise (Irwin-Hall luma) peaks at ~15-22% in a single bin.
+                const tile_px: u32 = rows * cols;
+                if (best_cnt * 100 < tile_px * 35) {
+                    var ry_z: u32 = 0;
+                    while (ry_z < rows) : (ry_z += 1) {
+                        const row_off = @as(usize, y_start + ry_z) * @as(usize, width) + x_start;
+                        @memset(fg[row_off .. row_off + cols], 0);
+                        @memset(mask[row_off .. row_off + cols], 0);
+                    }
+                    continue;
+                }
+
                 if (cols == 16) {
                     const bg_v: Vec16u8 = @splat(bg_u8);
                     var tile_fg: [16]Vec16u8 = undefined;
@@ -577,9 +591,9 @@ fn extractComponents(
             const bh = max_y - min_y + 1;
 
             // Keep glyph-sized components, reject UI boxes/borders/lines.
-            // Allow 1px-tall dashes/underscores (-, _) of width 3..14.
+            // Allow 1px-tall i-dots/dashes/underscores (., -, _) of width 2..14.
             if (bw == 0 or bh == 0) continue;
-            if (bh == 1 and (bw < 3 or bw > 14)) continue;
+            if (bh == 1 and (bw < 2 or bw > 14)) continue;
             if (bw > 44 or bh > 40) continue;
             if (bw > 24 and bh <= 3) continue;
             if (bh > 24 and bw <= 3) continue;
@@ -1308,6 +1322,27 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
                         continue;
                     }
                 }
+                // At word start, lowercase same-shape letter if clearly sitting at x-height (below cap-top)
+                const ref_h: f32 = @max(6.0, ref_bot - ref_top);
+                if (!has_left and has_right and isAsciiLower(right_cp) and g.y0 > 0 and ref_h >= 7.0) {
+                    const rh = glyphs[i + 1].height;
+                    const at_x_height = @as(f32, @floatFromInt(g.y0)) >= ref_top + ref_h * 0.14;
+                    if (at_x_height and g.height <= rh + 1 and @as(f32, @floatFromInt(g.height)) <= ref_h * 0.82) {
+                        g.cp = g.cp + 32;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 5b) ':' inside a lowercase word (e.g. Conf:gurac:ón -> Configuración when i-dot gap is wide)
+        if (g.cp == ':' and has_left and has_right and isAsciiLower(left_cp) and (isAsciiLower(right_cp) or isAsciiDigit(right_cp))) {
+            const ref_h_col: f32 = @max(6.0, ref_bot - ref_top);
+            const tall_like_i = ref_h_col >= 7.0 and @as(f32, @floatFromInt(g.height)) >= ref_h_col * 0.74;
+            const second_is_i = (g.second_cp == 'i' and (g.score - g.second_score) <= 0.16);
+            if (second_is_i or (tall_like_i and g.width <= 4)) {
+                g.cp = 'i';
+                continue;
             }
         }
 
@@ -1491,7 +1526,28 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
             const ref_bot: f32 = @floatFromInt(bots.items[(bots.items.len * 3) / 5]);
             const ref_h: f32 = @max(6.0, ref_bot - ref_top);
             const med_w: f32 = @floatFromInt(tmp_u32.items[tmp_u32.items.len / 2]);
-            const space_gap: f32 = @max(3.1, @min(med_w * 0.50, ref_h * 0.35));
+            const p25_w: f32 = @floatFromInt(tmp_u32.items[tmp_u32.items.len / 4]);
+            const is_monospace_like = (tmp_u32.items.len >= 6 and p25_w >= med_w * 0.78);
+            var space_gap: f32 = @max(3.2, @min(med_w * 0.52, ref_h * 0.36));
+
+            // Monospace adaptive spacing: only when glyph widths are uniform (fixed-pitch cells
+            // around narrow letters like r/t/i) scale space threshold above intra-word padding.
+            if (is_monospace_like) {
+                tmp_u32.clearRetainingCapacity();
+                for (1..slice.len) |gi| {
+                    if (slice[gi].x0 > slice[gi - 1].x1) {
+                        const gpx = slice[gi].x0 - slice[gi - 1].x1;
+                        if (gpx > 0 and gpx <= 12) tmp_u32.append(gpa, gpx) catch return;
+                    }
+                }
+                if (tmp_u32.items.len >= 4) {
+                    std.mem.sort(u32, tmp_u32.items, {}, u32Less);
+                    const med_gap: f32 = @floatFromInt(tmp_u32.items[tmp_u32.items.len / 2]);
+                    if (med_gap >= 2.0) {
+                        space_gap = @max(space_gap, med_gap * 2.15);
+                    }
+                }
+            }
 
             phrase_buf.clearRetainingCapacity();
             matched.clearRetainingCapacity();
@@ -1567,8 +1623,16 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
                 phrase_buf.appendSlice(gpa, utf8_buf[0..ulen]) catch return;
             }
             const mean_score = score_sum / @as(f32, @floatFromInt(char_cnt));
-            if (mean_score < 0.45) continue;
-            if (char_cnt == 1 and mean_score < 0.80) continue;
+            var alnum_cnt: u32 = 0;
+            for (matched.items) |mg| {
+                if (isAsciiAlpha(mg.cp) or isAsciiDigit(mg.cp)) alnum_cnt += 1;
+            }
+            // Calibrated noise/garbage rejection gates (prevents hallucinating OCR_OBSERVED on noise/textures)
+            if (mean_score < 0.52) continue;
+            if (char_cnt == 1 and mean_score < 0.82) continue;
+            if (char_cnt == 2 and (mean_score < 0.72 or (alnum_cnt == 0 and mean_score < 0.84))) continue;
+            if (char_cnt >= 3 and alnum_cnt == 0 and mean_score < 0.80) continue;
+            if (char_cnt >= 3 and alnum_cnt * 4 < char_cnt and mean_score < 0.74) continue;
 
             const owned = gpa.dupe(u8, phrase_buf.items) catch return;
             ctx.band_outs[bi].append(gpa, .{

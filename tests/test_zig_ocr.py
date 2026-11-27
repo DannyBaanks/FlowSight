@@ -49,18 +49,73 @@ def test_zig_ocr_empty_image_returns_ocr_empty():
 
 @pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
 def test_oneshot_report_detects_top_chrome_tabs(tmp_path):
-    img = Image.new("RGB", (1200, 300), (14, 18, 26))
+    # Non-Q13 geometry (title y=12, tab strip y=48) with genuine visual tab-strip evidence
+    # (distinct active-tab fill + continuous horizontal divider below tab strip).
+    img = Image.new("RGB", (960, 300), (20, 24, 32))
     draw = ImageDraw.Draw(img)
-    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
-    draw.text((480, 44), "danny@host:~/workspace", fill=(220, 226, 235), font=font)
-    draw.text((160, 88), "tab-one:~/workspace", fill=(220, 226, 235), font=font)
-    draw.text((760, 88), "tab-two:~/workspace", fill=(220, 226, 235), font=font)
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+    draw.rectangle([0, 0, 960, 38], fill=(16, 20, 28))
+    draw.text((360, 12), "Mi Navegador", fill=(220, 226, 235), font=font)
+    draw.rectangle([0, 38, 960, 72], fill=(26, 30, 40))
+    draw.rectangle([40, 40, 260, 72], fill=(58, 66, 84))  # active tab distinct fill
+    draw.text((64, 48), "Inicio del proyecto", fill=(242, 246, 252), font=font)
+    draw.text((320, 48), "Documentación API", fill=(180, 188, 202), font=font)
+    draw.line([0, 72, 960, 72], fill=(95, 108, 130), width=1)
     p = tmp_path / "chrome.png"
     img.save(p)
     ctx = flowsight_screen.run_pipeline(str(p), vf="theme,layout,controls,ocr=backend=zig,ui_map")
     rep = flowsight_screen.format_pipeline_report(ctx, max_chars=16000, ocr_limit=150)
-    assert "TOP CHROME STRUCTURE" in rep
+    assert "TOP CHROME STRUCTURE (INFERRED" in rep
+    assert "DEMONSTRATED" not in rep.split("TOP CHROME STRUCTURE")[1].splitlines()[0]
     assert "2 tabs" in rep
+
+
+@pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
+def test_top_chrome_rejects_toolbar_buttons_and_form_labels(tmp_path):
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+
+    # Negative 1: Toolbar with two buttons ("Guardar", "Exportar") — must NOT be labeled tabs
+    img_btn = Image.new("RGB", (900, 300), (24, 28, 36))
+    d = ImageDraw.Draw(img_btn)
+    d.text((320, 34), "Editor de documento", fill=(230, 235, 242), font=font)
+    d.rectangle([120, 74, 230, 104], fill=(48, 60, 82), outline=(80, 96, 120))
+    d.text((142, 81), "Guardar", fill=(235, 240, 248), font=font)
+    d.rectangle([340, 74, 460, 104], fill=(48, 60, 82), outline=(80, 96, 120))
+    d.text((362, 81), "Exportar", fill=(235, 240, 248), font=font)
+    p_btn = tmp_path / "buttons.png"
+    img_btn.save(p_btn)
+    rep_btn = flowsight_screen.format_pipeline_report(
+        flowsight_screen.run_pipeline(str(p_btn), vf="ocr=backend=zig"), max_chars=8000, ocr_limit=50
+    )
+    assert "TOP CHROME STRUCTURE" not in rep_btn
+
+    # Negative 2: Form labels on uniform background — must NOT be labeled tabs
+    img_frm = Image.new("RGB", (900, 300), (245, 246, 248))
+    d = ImageDraw.Draw(img_frm)
+    d.text((340, 34), "Nuevo registro", fill=(25, 28, 34), font=font)
+    d.text((100, 82), "Nombre completo", fill=(40, 45, 55), font=font)
+    d.text((420, 82), "Correo electrónico", fill=(40, 45, 55), font=font)
+    p_frm = tmp_path / "form.png"
+    img_frm.save(p_frm)
+    rep_frm = flowsight_screen.format_pipeline_report(
+        flowsight_screen.run_pipeline(str(p_frm), vf="ocr=backend=zig"), max_chars=8000, ocr_limit=50
+    )
+    assert "TOP CHROME STRUCTURE" not in rep_frm
+
+
+@pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
+def test_zig_ocr_rejects_pure_noise_and_checkerboard():
+    rng = np.random.default_rng(42)
+    noise = rng.integers(0, 256, size=(540, 960, 3), dtype=np.uint8)
+    res_n = flowsight_ocr._run_zig_ocr(noise, 0, 0, "noise", "spa+eng", 60.0, 10.0)
+    assert res_n["status"] == flowsight_ocr.OCR_EMPTY
+    assert res_n["items"] == []
+
+    yy, xx = np.indices((300, 400))
+    checker = np.stack([(((xx // 4 + yy // 4) % 2) * 255).astype(np.uint8)] * 3, axis=-1)
+    res_c = flowsight_ocr._run_zig_ocr(checker, 0, 0, "checker", "spa+eng", 60.0, 10.0)
+    assert res_c["status"] == flowsight_ocr.OCR_EMPTY
+    assert res_c["items"] == []
 
 
 @pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
