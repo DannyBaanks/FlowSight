@@ -1194,9 +1194,18 @@ fn matchOrSplitGlyph(
                 const rm = matchBox(fg, mask, img_w, atlas, split_x, rb.y0, x1, rb.y1, ref_top, ref_h);
                 const mean_lr = (lm.score + rm.score) * 0.5;
                 const min_lr = @min(lm.score, rm.score);
+                const lw = split_x - x0;
+                const rw = x1 - split_x;
                 const margin: f32 = if (is_wide_single) 0.07 else 0.025;
+                // A 3+ glyph touching blob (e.g. "Ope", "hos", "sas") scores ~0.10 as a single box;
+                // splitting off one clean letter leaves a 2-glyph remainder that scores < 0.42 until
+                // the recursive call splits it. Allow the first cut when one side is clearly a glyph.
+                const multi_blob_accept = (depth < 1) and (single.score < 0.35) and
+                    ((lm.score >= 0.65 and rw >= 6) or (rm.score >= 0.65 and lw >= 6)) and
+                    mean_lr > single.score + 0.15;
                 const accept = (min_lr >= 0.42 and mean_lr > single.score + margin) or
-                    (single.score < 0.62 and min_lr >= 0.45 and mean_lr > single.score - 0.02);
+                    (single.score < 0.62 and min_lr >= 0.45 and mean_lr > single.score - 0.02) or
+                    multi_blob_accept;
                 if (accept and mean_lr > best_split_mean) {
                     best_split_mean = mean_lr;
                     best_split_x = split_x;
