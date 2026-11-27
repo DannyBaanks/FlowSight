@@ -119,6 +119,25 @@ def test_zig_ocr_rejects_pure_noise_and_checkerboard():
 
 
 @pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
+def test_zig_ocr_rejects_smooth_textures_but_reads_text_on_them():
+    """Smooth textures (blurred photos/wallpapers) have a dominant background bin, so the
+    coherence gate alone lets them through; the edge-sharpness gate must reject them."""
+    rng = np.random.default_rng(7)
+    for scale in (8, 24):
+        coarse = rng.integers(0, 256, size=(540 // scale + 2, 960 // scale + 2, 3), dtype=np.uint8)
+        smooth = np.asarray(Image.fromarray(coarse).resize((960, 540), Image.BICUBIC))
+        res = flowsight_ocr.run_ocr(smooth, 0, 0, f"smooth{scale}", backend="zig")
+        assert res["items"] == [], f"scale={scale} hallucinated {[it['text'] for it in res['items']][:8]}"
+
+    coarse = np.random.default_rng(7).integers(0, 80, size=(9, 26, 3), dtype=np.uint8)
+    img = Image.fromarray(np.asarray(Image.fromarray(coarse).resize((600, 100), Image.BICUBIC)))
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+    ImageDraw.Draw(img).text((20, 40), "error: file not found", fill=(250, 250, 250), font=font)
+    res = flowsight_ocr.run_ocr(np.asarray(img), 0, 0, "text_on_texture", backend="zig")
+    assert any("file not found" in it["text"] for it in res["items"]), [it["text"] for it in res["items"]]
+
+
+@pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
 def test_zig_ocr_preserves_hyphens_underscores_and_stacked_lines():
     img = Image.new("RGB", (640, 140), (18, 22, 30))
     draw = ImageDraw.Draw(img)

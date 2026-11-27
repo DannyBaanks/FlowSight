@@ -283,6 +283,9 @@ const FgWorkerCtx = struct {
     next_ty: std.atomic.Value(u32),
 };
 
+/// Minimum largest-1px-step / tile-luma-range ratio (percent) for a tile to keep foreground.
+const SHARP_STEP_PCT: u32 = 30;
+
 fn fgWorkerRun(ctx: *FgWorkerCtx) void {
     const tile: u32 = 16;
     const img = ctx.img;
@@ -316,15 +319,31 @@ fn fgWorkerRun(ctx: *FgWorkerCtx) void {
                 // 16-bin histogram to find dominant background luma in tile
                 var hist_cnt: [16]u32 = .{0} ** 16;
                 var hist_sum: [16]u32 = .{0} ** 16;
+                // Largest 1-px luma step (horizontal or vertical) inside the tile: glyph strokes are
+                // 1-3 px wide, so their edges jump a large fraction of the stroke contrast in one pixel.
+                var max_step: u32 = 0;
+                var tile_lo: u32 = 255;
+                var tile_hi: u32 = 0;
 
                 var y = y_start;
                 while (y < y_end) : (y += 1) {
                     const row_off = @as(usize, y) * @as(usize, width) + x_start;
                     const row = img.pixels[row_off .. row_off + cols];
-                    for (row) |p| {
+                    const prev_row: ?[]const u8 = if (y > y_start) img.pixels[row_off - width .. row_off - width + cols] else null;
+                    for (row, 0..) |p, xi| {
                         const bin: usize = p >> 4;
                         hist_cnt[bin] += 1;
                         hist_sum[bin] += p;
+                        if (p < tile_lo) tile_lo = p;
+                        if (p > tile_hi) tile_hi = p;
+                        if (xi > 0) {
+                            const s: u32 = @abs(@as(i32, p) - @as(i32, row[xi - 1]));
+                            if (s > max_step) max_step = s;
+                        }
+                        if (prev_row) |pr| {
+                            const s: u32 = @abs(@as(i32, p) - @as(i32, pr[xi]));
+                            if (s > max_step) max_step = s;
+                        }
                     }
                 }
 
@@ -342,7 +361,12 @@ fn fgWorkerRun(ctx: *FgWorkerCtx) void {
                 // >=35% of tile pixels in the single dominant histogram bin (width 16 luma);
                 // uniform RGB random noise (Irwin-Hall luma) peaks at ~15-22% in a single bin.
                 const tile_px: u32 = rows * cols;
-                if (best_cnt * 100 < tile_px * 35) {
+                // Edge-sharpness gate: smooth textures (blurred photos, wallpapers, upscaled noise) span a
+                // large luma range but only through gradual ramps, so no single 1-px step reaches a
+                // meaningful fraction of that range. Text strokes always do.
+                const tile_range: u32 = tile_hi - tile_lo;
+                const smooth_texture = tile_range >= 36 and max_step * 100 < tile_range * SHARP_STEP_PCT;
+                if (best_cnt * 100 < tile_px * 35 or smooth_texture) {
                     var ry_z: u32 = 0;
                     while (ry_z < rows) : (ry_z += 1) {
                         const row_off = @as(usize, y_start + ry_z) * @as(usize, width) + x_start;
