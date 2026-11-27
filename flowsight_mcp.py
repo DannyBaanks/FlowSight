@@ -21,6 +21,10 @@ Opt-in VLM escalation (`vlm_probe`) stays disabled unless FLOWSIGHT_VLM_ENABLED=
 from __future__ import annotations
 
 import hashlib
+import os
+import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 import tempfile
 from typing import Literal
@@ -34,6 +38,65 @@ import flowsight_index as fidx
 import flowsight_screen as fscr
 import flowsight_timeline as ftl
 import flowsight_vlm as fvlm
+
+
+# ============================================================================
+# In-process LRU cache for pipeline context
+# Key: (resolved_path, file_sha256_or_mtime_size, vf_string, vlm_policy)
+# Bounded to 8 entries, invalidated when file changes
+# ============================================================================
+
+_PIPELINE_CACHE_MAX = 8
+_pipeline_cache: OrderedDict[tuple, tuple[object, str]] = OrderedDict()  # key -> (ctx, cache_status)
+_pipeline_cache_lock = threading.Lock()
+
+
+def _file_cache_key(image_path: str) -> tuple[str, str]:
+    """Return (resolved_path, file_fingerprint) where fingerprint is sha256 or mtime_ns+size."""
+    p = Path(image_path).resolve()
+    try:
+        st = p.stat()
+        # Use mtime_ns + size for fast fingerprint; fallback to sha256 if needed
+        fingerprint = f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        fingerprint = "missing"
+    return (str(p), fingerprint)
+
+
+def _get_cached_pipeline(image_path: str, vf: str, vlm_policy: str, vlm_backend: str) -> tuple[object | None, str]:
+    """Get cached pipeline context. Returns (ctx, cache_status) where cache_status is 'HIT' or 'MISS'."""
+    path_key, file_fp = _file_cache_key(image_path)
+    cache_key = (path_key, file_fp, vf, vlm_policy, vlm_backend)
+
+    with _pipeline_cache_lock:
+        if cache_key in _pipeline_cache:
+            ctx, _ = _pipeline_cache[cache_key]
+            # Move to end (most recently used)
+            _pipeline_cache.move_to_end(cache_key)
+            return ctx, 'HIT'
+        return None, 'MISS'
+
+
+def _set_cached_pipeline(image_path: str, vf: str, vlm_policy: str, vlm_backend: str, ctx: object) -> None:
+    """Store pipeline context in LRU cache."""
+    path_key, file_fp = _file_cache_key(image_path)
+    cache_key = (path_key, file_fp, vf, vlm_policy, vlm_backend)
+
+    with _pipeline_cache_lock:
+        _pipeline_cache[cache_key] = (ctx, 'HIT')
+        _pipeline_cache.move_to_end(cache_key)
+        # Evict oldest if over capacity
+        while len(_pipeline_cache) > _PIPELINE_CACHE_MAX:
+            _pipeline_cache.popitem(last=False)
+
+
+def _invalidate_pipeline_cache_for_path(image_path: str) -> None:
+    """Invalidate all cache entries for a given image path."""
+    path_key, _ = _file_cache_key(image_path)
+    with _pipeline_cache_lock:
+        keys_to_remove = [k for k in _pipeline_cache.keys() if k[0] == path_key]
+        for k in keys_to_remove:
+            del _pipeline_cache[k]
 
 mcp = MCPServer(
     'flowsight',
@@ -232,11 +295,29 @@ def flowsight_screen_run(
     image_path: str,
     vf: str = 'theme,layout,controls,text_bands,ocr,ui_map=48:20',
     max_chars: int = 6500,
+    ocr_limit: int = 25,
 ) -> str:
     try:
         vlm_policy, vlm_backend = fvlm.resolve_runtime_vlm_config()
-        ctx = fscr.run_pipeline(image_path, vf=vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
-        return fscr.format_pipeline_report(ctx, max_chars=max(500, max_chars))
+
+        # Check cache
+        cached_ctx, cache_status = _get_cached_pipeline(image_path, vf, vlm_policy, vlm_backend)
+        if cached_ctx is not None:
+            ctx = cached_ctx
+        else:
+            ctx = fscr.run_pipeline(image_path, vf=vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
+            _set_cached_pipeline(image_path, vf, vlm_policy, vlm_backend, ctx)
+
+        try:
+            report = fscr.format_pipeline_report(ctx, max_chars=max(500, max_chars), ocr_limit=max(1, min(400, ocr_limit)))
+        except TypeError:
+            report = fscr.format_pipeline_report(ctx, max_chars=max(500, max_chars))
+        # Inject cache status into report header
+        if report.startswith('FLOWSIGHT SCREEN v1'):
+            report = report.replace('FLOWSIGHT SCREEN v1', f'FLOWSIGHT SCREEN v1 [cache={cache_status}]', 1)
+        elif f'cache={cache_status}' not in report:
+            report = f'FLOWSIGHT [cache={cache_status}]\n' + report
+        return report
     except (fscr.FilterDeny, fb.BlocksDeny) as e:
         return f'DENY {e}'
 
@@ -255,8 +336,22 @@ def flowsight_screen_query(
 ) -> str:
     try:
         vlm_policy, vlm_backend = fvlm.resolve_runtime_vlm_config()
-        ctx = fscr.run_pipeline(image_path, vf=vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
-        return fscr.query_canonical(ctx, selector)
+
+        # Check cache
+        cached_ctx, cache_status = _get_cached_pipeline(image_path, vf, vlm_policy, vlm_backend)
+        if cached_ctx is not None:
+            ctx = cached_ctx
+        else:
+            ctx = fscr.run_pipeline(image_path, vf=vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
+            _set_cached_pipeline(image_path, vf, vlm_policy, vlm_backend, ctx)
+
+        result = fscr.query_canonical(ctx, selector)
+        # Inject cache status into result header
+        if result.startswith('FLOWSIGHT'):
+            result = result.replace('FLOWSIGHT', f'FLOWSIGHT [cache={cache_status}]', 1)
+        else:
+            result = f'FLOWSIGHT QUERY selector={selector} [cache={cache_status}]\n' + result
+        return result
     except (fscr.FilterDeny, fb.BlocksDeny) as e:
         return f'DENY {e}'
 
