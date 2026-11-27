@@ -508,6 +508,8 @@ const MatchedGlyph = struct {
     gap_before: f32,
     width: u32,
     height: u32,
+    y0: u32 = 0,
+    y1: u32 = 0,
 };
 
 /// Hot-path SIMD shape matcher returning top-2 distinct codepoints (aspect-indexed).
@@ -779,6 +781,8 @@ fn matchOrSplitGlyph(
         .gap_before = gap_before,
         .width = bw,
         .height = bh,
+        .y0 = y0,
+        .y1 = y1,
     });
 }
 
@@ -806,8 +810,9 @@ fn isAsciiAlpha(cp: u32) bool {
     return isAsciiLower(cp) or isAsciiUpper(cp);
 }
 
-/// Disambiguate isolated-glyph confusions (1/i/l/I, 0/O/o, í/i, and same-shape case) using immediate token neighbors.
-fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32) void {
+/// Disambiguate isolated-glyph confusions (¡/i, 8/g, 1/i/l/I, 0/O/o, í/i, I/l/i, and same-shape case)
+/// using immediate token neighbors and baseline/cap-height geometry.
+fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_bot: f32) void {
     const n = glyphs.len;
     if (n < 2) return;
 
@@ -823,10 +828,35 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32) void {
         const near_upper = isAsciiUpper(left_cp) or isAsciiUpper(right_cp);
         const near_alpha = near_lower or near_upper;
 
-        // 0) Weak 'í' vs 'i' confusion on mono fonts where i-dot slightly resembles acute accent
+        // 0a) '¡' (inverted bang) inside a word (e.g., real¡zada, Evidenc¡a, P¡de) or non-descending before lowercase (¡magen) -> 'i'
+        //     Preserves real '¡Hola!' (word-start + uppercase/descending).
+        if (g.cp == 0x00A1) {
+            if (has_left and isAsciiAlpha(left_cp)) {
+                g.cp = 'i';
+                continue;
+            }
+            if (!has_left and has_right and isAsciiLower(right_cp) and @as(f32, @floatFromInt(g.y1)) <= ref_bot + 1.0) {
+                g.cp = 'i';
+                continue;
+            }
+        }
+
+        // 0b) Weak 'í' vs 'i' confusion on mono fonts where i-dot slightly resembles acute accent
         if (g.cp == 0x00ED and g.second_cp == 'i' and (g.score - g.second_score) < 0.035) {
             g.cp = 'i';
             continue;
+        }
+
+        // 0c) '8' inside a purely alphabetic lowercase word (e.g., FlowSi8ht, ima8en, pre8unta, 8lobal) -> 'g'
+        //     Double-story sans-serif 'g' shares holes=2 with '8', but descends below baseline or starts at x-height.
+        if (g.cp == '8' and near_lower and !near_digit) {
+            const looks_like_g = (g.second_cp == 'g') or
+                (@as(f32, @floatFromInt(g.y1)) > ref_bot + 1.0) or
+                (@as(f32, @floatFromInt(g.y0)) >= ref_top + 1.5);
+            if (looks_like_g) {
+                g.cp = 'g';
+                continue;
+            }
         }
 
         // 1) 'O' or 'o' inside a numeric token (e.g., 2O26, 11:O1) -> '0'
@@ -863,6 +893,23 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32) void {
                 g.cp = '1';
             }
             continue;
+        }
+
+        // 4b) Sans-serif 'I' inside lowercase words (e.g., pipeIine, soIo, eI, shouId, FIow, detaIIe, Ilamada, artIfacts) -> 'l' or 'i'
+        if (g.cp == 'I' and !near_digit) {
+            const after_lower = has_left and isAsciiLower(left_cp);
+            const before_distinct_upper = has_right and isAsciiUpper(right_cp) and right_cp != 'I';
+            const after_upper_before_lower = has_left and isAsciiUpper(left_cp) and has_right and isAsciiLower(right_cp);
+            const double_l_start = !has_left and has_right and (right_cp == 'l' or right_cp == 'I') and
+                (i + 2 < n and glyphs[i + 2].gap_before < space_gap * 1.15 and isAsciiLower(glyphs[i + 2].cp));
+            if ((after_lower and !before_distinct_upper) or after_upper_before_lower or double_l_start) {
+                if (g.second_cp == 'i' and (g.score - g.second_score) <= 0.12) {
+                    g.cp = 'i';
+                } else {
+                    g.cp = 'l';
+                }
+                continue;
+            }
         }
 
         // 5) Same-shape uppercase inside a lowercase word (e.g., DeSCribe, BuSCar, archiVOs, ComandoS)
@@ -1245,8 +1292,9 @@ fn recognizeLines(
                 if (clamped < min_score) min_score = clamped;
             }
 
-            // Contextual disambiguation pass (1/i/l/I, 0/O/o, í/i, and same-shape case within tokens)
-            disambiguatePhrase(matched.items, space_gap);
+            // Contextual disambiguation (2 passes so cascaded pairs like detaIIe->detalle, 8Iobal->global resolve cleanly)
+            disambiguatePhrase(matched.items, space_gap, ref_top, ref_bot);
+            disambiguatePhrase(matched.items, space_gap, ref_top, ref_bot);
 
             for (matched.items, 0..) |mg, gi| {
                 if (gi > 0) {
@@ -1430,7 +1478,7 @@ test "disambiguatePhrase fixes 2O26 -> 2026 and sal1da -> salida" {
         .{ .cp = '2', .score = 0.9, .second_cp = 'Z', .second_score = 0.6, .gap_before = 1, .width = 7, .height = 11 },
         .{ .cp = '6', .score = 0.9, .second_cp = 'G', .second_score = 0.6, .gap_before = 1, .width = 7, .height = 11 },
     };
-    disambiguatePhrase(&num_tok, 4.0);
+    disambiguatePhrase(&num_tok, 4.0, 10.0, 21.0);
     try std.testing.expectEqual(@as(u32, '0'), num_tok[1].cp);
 
     var word_tok = [_]MatchedGlyph{
@@ -1441,7 +1489,7 @@ test "disambiguatePhrase fixes 2O26 -> 2026 and sal1da -> salida" {
         .{ .cp = 'd', .score = 0.9, .second_cp = 'b', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 11 },
         .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.7, .gap_before = 1, .width = 6, .height = 8 },
     };
-    disambiguatePhrase(&word_tok, 4.0);
+    disambiguatePhrase(&word_tok, 4.0, 10.0, 21.0);
     try std.testing.expectEqual(@as(u32, 'i'), word_tok[3].cp);
 
     var case_tok = [_]MatchedGlyph{
@@ -1452,7 +1500,24 @@ test "disambiguatePhrase fixes 2O26 -> 2026 and sal1da -> salida" {
         .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.7, .gap_before = 1, .width = 6, .height = 8 },
         .{ .cp = 'r', .score = 0.9, .second_cp = 't', .second_score = 0.7, .gap_before = 1, .width = 4, .height = 8 },
     };
-    disambiguatePhrase(&case_tok, 4.0);
+    disambiguatePhrase(&case_tok, 4.0, 10.0, 21.0);
     try std.testing.expectEqual(@as(u32, 's'), case_tok[2].cp);
     try std.testing.expectEqual(@as(u32, 'c'), case_tok[3].cp);
+
+    // FIowS¡8ht -> FlowSight (I->l after cap before lower, ¡->i inside word, 8->g inside word)
+    var fs_tok = [_]MatchedGlyph{
+        .{ .cp = 'F', .score = 0.9, .second_cp = 'E', .second_score = 0.6, .gap_before = 0, .width = 6, .height = 11, .y0 = 10, .y1 = 21 },
+        .{ .cp = 'I', .score = 0.9, .second_cp = 'l', .second_score = 0.89, .gap_before = 1, .width = 2, .height = 11, .y0 = 10, .y1 = 21 },
+        .{ .cp = 'o', .score = 0.9, .second_cp = 'O', .second_score = 0.7, .gap_before = 1, .width = 6, .height = 8, .y0 = 13, .y1 = 21 },
+        .{ .cp = 'w', .score = 0.9, .second_cp = 'W', .second_score = 0.7, .gap_before = 1, .width = 8, .height = 8, .y0 = 13, .y1 = 21 },
+        .{ .cp = 'S', .score = 0.9, .second_cp = 's', .second_score = 0.7, .gap_before = 1, .width = 6, .height = 11, .y0 = 10, .y1 = 21 },
+        .{ .cp = 0x00A1, .score = 0.85, .second_cp = 'i', .second_score = 0.84, .gap_before = 1, .width = 2, .height = 11, .y0 = 10, .y1 = 21 },
+        .{ .cp = '8', .score = 0.84, .second_cp = 'g', .second_score = 0.82, .gap_before = 1, .width = 6, .height = 11, .y0 = 13, .y1 = 24 },
+        .{ .cp = 'h', .score = 0.9, .second_cp = 'n', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 11, .y0 = 10, .y1 = 21 },
+        .{ .cp = 't', .score = 0.9, .second_cp = 'f', .second_score = 0.6, .gap_before = 1, .width = 4, .height = 10, .y0 = 11, .y1 = 21 },
+    };
+    disambiguatePhrase(&fs_tok, 4.0, 10.0, 21.0);
+    try std.testing.expectEqual(@as(u32, 'l'), fs_tok[1].cp);
+    try std.testing.expectEqual(@as(u32, 'i'), fs_tok[5].cp);
+    try std.testing.expectEqual(@as(u32, 'g'), fs_tok[6].cp);
 }
