@@ -858,7 +858,26 @@ const MatchedGlyph = struct {
     /// Set when case was decided from phrase-level x-height/cap-height geometry; later
     /// neighbor-based case heuristics must not override it.
     case_locked: bool = false,
+    /// Fraction of bbox rows containing ink. A colon is two dots with a large gap (~0.5);
+    /// a split 'i' stem or an 'l' covers nearly every row (>=0.85).
+    row_cov: f32 = 1.0,
 };
+
+fn rowInkCoverage(mask: []const u8, img_w: u32, x0: u32, y0: u32, x1: u32, y1: u32) f32 {
+    if (y1 <= y0 or x1 <= x0) return 0.0;
+    var rows_with_ink: u32 = 0;
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        const off = @as(usize, y) * @as(usize, img_w);
+        for (mask[off + x0 .. off + x1]) |m| {
+            if (m != 0) {
+                rows_with_ink += 1;
+                break;
+            }
+        }
+    }
+    return @as(f32, @floatFromInt(rows_with_ink)) / @as(f32, @floatFromInt(y1 - y0));
+}
 
 inline fn dotI8Simd(q: *const TemplateVec, t: *const TemplateVec) f32 {
     // Accumulate pairs of chunks in i16 (max |2 * 127 * 127| = 32258 < 32767, overflow-free),
@@ -1200,6 +1219,7 @@ fn matchOrSplitGlyph(
         .height = bh,
         .y0 = y0,
         .y1 = y1,
+        .row_cov = rowInkCoverage(mask, img_w, x0, y0, x1, y1),
     });
 }
 
@@ -1249,7 +1269,7 @@ fn medianSmall(vals: []u32) f32 {
 /// cap references: at small sizes they are often 1-2 px taller than capitals.
 /// The atlas normalizes glyph boxes, so the matcher cannot tell these apart by shape.
 /// Without an x-height reference nothing is decided (the neighbor heuristics still apply).
-fn resolveSameShapeCase(glyphs: []MatchedGlyph) void {
+fn resolveSameShapeCase(glyphs: []MatchedGlyph) ?f32 {
     var xs: [64]u32 = undefined;
     var cs: [64]u32 = undefined;
     var nx: usize = 0;
@@ -1267,11 +1287,11 @@ fn resolveSameShapeCase(glyphs: []MatchedGlyph) void {
             else => {},
         }
     }
-    if (nx == 0) return;
+    if (nx == 0) return null;
     const xh = medianSmall(xs[0..nx]);
     // Typical sans/mono cap-height / x-height ratio is ~1.33-1.40; used only when no capital is present.
     const ch = if (nc > 0) medianSmall(cs[0..nc]) else xh * 1.37;
-    if (ch < xh + 1.5) return; // not separable at this size (or references are wrong)
+    if (ch < xh + 1.5) return xh; // case not separable at this size (or references are wrong)
     const mid = (xh + ch) * 0.5;
     for (glyphs) |*g| {
         if (!isHeightOnlyCasePair(g.cp)) continue;
@@ -1288,6 +1308,7 @@ fn resolveSameShapeCase(glyphs: []MatchedGlyph) void {
         if (!lower and !is_up) g.cp -= 32;
         g.case_locked = true;
     }
+    return xh;
 }
 
 /// Disambiguate isolated-glyph confusions (¡/i, 8/g, 1/i/l/I, 0/O/o, í/i, I/l/i, and same-shape case)
@@ -1295,7 +1316,7 @@ fn resolveSameShapeCase(glyphs: []MatchedGlyph) void {
 fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_bot: f32) void {
     const n = glyphs.len;
     if (n < 2) return;
-    resolveSameShapeCase(glyphs);
+    const phrase_xh = resolveSameShapeCase(glyphs);
 
     for (0..n) |i| {
         const g = &glyphs[i];
@@ -1412,6 +1433,25 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
                         g.cp = g.cp + 32;
                         continue;
                     }
+                }
+            }
+        }
+
+        // 5a) ':' / '!' between two letters that is a solid stem (ink in nearly every row) or clearly
+        //     taller than the phrase x-height is an 'i' / 'l' whose dot or stem split off
+        //     (Ubuntu/Noto 12-13px: S:stema, Cl:ck, Sa!:da). A real colon is two dots with a gap,
+        //     spanning only the x-height, so "Usuario:admin" / "key:value" are kept.
+        const left_ok = isAsciiAlpha(left_cp) or left_cp == ':' or left_cp == '!' or left_cp == 'i' or left_cp == 'l';
+        const right_ok = isAsciiAlpha(right_cp) or right_cp == ':' or right_cp == '!';
+        if ((g.cp == ':' or g.cp == '!') and has_left and has_right and left_ok and right_ok and
+            (isAsciiAlpha(left_cp) or isAsciiAlpha(right_cp)))
+        {
+            const solid_stem = g.row_cov >= 0.85 and g.height >= 5;
+            const taller_than_x = if (phrase_xh) |xh| @as(f32, @floatFromInt(g.height)) >= xh + @max(1.5, xh * 0.22) else false;
+            {
+                if (solid_stem or taller_than_x) {
+                    g.cp = if (g.cp == ':') 'i' else 'l';
+                    continue;
                 }
             }
         }
@@ -2327,4 +2367,32 @@ test "resolveSameShapeCase keeps capitals when ascenders are taller than caps (D
     try std.testing.expectEqual(@as(u32, 'o'), tok[1].cp);
     try std.testing.expectEqual(@as(u32, 's'), tok[2].cp);
     try std.testing.expectEqual(@as(u32, 'S'), tok[5].cp);
+}
+
+test "split i stem read as ':' becomes 'i'; a real colon with a gap is kept" {
+    // Ubuntu 13px "Sistema": the i stem breaks into two blobs, matched as ':' (solid, row_cov 1.0).
+    var word = [_]MatchedGlyph{
+        .{ .cp = 'S', .score = 0.9, .second_cp = 's', .second_score = 0.6, .gap_before = 0, .width = 6, .height = 9 },
+        .{ .cp = ':', .score = 0.8, .second_cp = '.', .second_score = 0.6, .gap_before = 1, .width = 2, .height = 7, .row_cov = 1.0 },
+        .{ .cp = 's', .score = 0.9, .second_cp = 'S', .second_score = 0.6, .gap_before = 2, .width = 5, .height = 7 },
+        .{ .cp = 't', .score = 0.9, .second_cp = 'f', .second_score = 0.6, .gap_before = 2, .width = 4, .height = 9 },
+        .{ .cp = 'e', .score = 0.9, .second_cp = 'c', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 'm', .score = 0.9, .second_cp = 'n', .second_score = 0.6, .gap_before = 1, .width = 9, .height = 7 },
+        .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+    };
+    disambiguatePhrase(&word, 3.2, 10.0, 21.0);
+    try std.testing.expectEqual(@as(u32, 'i'), word[1].cp);
+
+    // "key:value": a real colon is two dots spanning the x-height (row_cov ~0.57).
+    var kv = [_]MatchedGlyph{
+        .{ .cp = 'k', .score = 0.9, .second_cp = 'K', .second_score = 0.6, .gap_before = 0, .width = 6, .height = 10 },
+        .{ .cp = 'e', .score = 0.9, .second_cp = 'c', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 'y', .score = 0.9, .second_cp = 'v', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 9 },
+        .{ .cp = ':', .score = 0.9, .second_cp = '.', .second_score = 0.6, .gap_before = 1, .width = 2, .height = 7, .row_cov = 0.57 },
+        .{ .cp = 'v', .score = 0.9, .second_cp = 'V', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 'l', .score = 0.9, .second_cp = 'I', .second_score = 0.6, .gap_before = 1, .width = 2, .height = 10 },
+    };
+    disambiguatePhrase(&kv, 3.2, 10.0, 21.0);
+    try std.testing.expectEqual(@as(u32, ':'), kv[3].cp);
 }

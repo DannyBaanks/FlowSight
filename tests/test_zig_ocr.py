@@ -210,3 +210,22 @@ def test_cli_ocr_backend_flag_rewrites_ocr_filter(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "Guardar cambios" in out
+
+
+@pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
+def test_zig_ocr_case_and_split_i_at_13px_keeps_real_colons():
+    """Regressions from the 4b85bf5 audit: capitals lowercased at 13px, ':' for 'i' in Ubuntu 13px."""
+    lines = ["Configuración del sistema", "Origen y Salida", "Sistema operativo", "key:value pairs", "Usuario: admin"]
+    fonts = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf"]
+    for fp in fonts:
+        img = Image.new("RGB", (420, 30 * len(lines) + 20), (30, 30, 30))
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.truetype(fp, 13)
+        for i, t in enumerate(lines):
+            draw.text((14, 10 + i * 30), t, fill=(230, 230, 230), font=font)
+        res = flowsight_ocr.run_ocr(np.asarray(img), 0, 0, "case13", backend="zig")
+        text = " | ".join(it["text"] for it in sorted(res["items"], key=lambda it: it["bbox"][1]))
+        assert "Configuración" in text, (fp, text)
+        assert "Sistema" in text and "S:stema" not in text, (fp, text)
+        assert "key:value" in text, (fp, text)
+        assert "Usuario:" in text or "Usuario :" in text, (fp, text)
