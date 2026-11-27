@@ -1365,6 +1365,24 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
             continue;
         }
 
+        // 0b') Solid 'í'/'Í' (row_cov >= 0.95, no accent gap) whose runner-up is 'f' is a serifed
+        //      mono 'f' (Nimbus Mono 12-16px: error:íile, Coníiguración, error:Íile).
+        if ((g.cp == 0x00ED or g.cp == 0x00CD) and g.second_cp == 'f' and
+            g.row_cov >= 0.95 and (g.score - g.second_score) < 0.08)
+        {
+            g.cp = 'f';
+            continue;
+        }
+
+        // 0b'') Solid '=' inside an alphabetic word (row_cov >= 0.85; a real '=' has a gap between
+        //       bars) whose runner-up is a letter ('m' in Nimbus Mono 12-13px "admin") -> second_cp.
+        if (g.cp == '=' and has_left and has_right and isAsciiAlpha(left_cp) and isAsciiAlpha(right_cp) and
+            g.row_cov >= 0.85 and isAsciiAlpha(g.second_cp) and (g.score - g.second_score) < 0.08)
+        {
+            g.cp = g.second_cp;
+            continue;
+        }
+
         // 0c) '8' inside a purely alphabetic lowercase word (e.g., FlowSi8ht, ima8en, pre8unta, 8lobal) -> 'g'
         //     Double-story sans-serif 'g' shares holes=2 with '8', but descends below baseline or starts at x-height.
         if (g.cp == '8' and near_lower and !near_digit) {
@@ -2626,4 +2644,25 @@ test "word-boundary solid-stem '!' and ascender-tall ',' become 'l'; real '!' is
     };
     disambiguatePhrase(&del_comma, 3.3, 10.0, 20.0);
     try std.testing.expectEqual(@as(u32, 'l'), del_comma[2].cp);
+}
+
+test "solid 'í' with runner-up 'f' becomes 'f'; solid '=' inside word with runner-up 'm' becomes 'm'" {
+    var file_tok = [_]MatchedGlyph{
+        .{ .cp = 0x00ED, .score = 0.781, .second_cp = 'f', .second_score = 0.776, .gap_before = 0, .width = 5, .height = 9, .row_cov = 1.0 },
+        .{ .cp = 'i', .score = 0.861, .second_cp = 0x00ED, .second_score = 0.842, .gap_before = 1, .width = 3, .height = 9, .row_cov = 0.89 },
+        .{ .cp = 'l', .score = 0.960, .second_cp = '1', .second_score = 0.933, .gap_before = 2, .width = 6, .height = 9, .row_cov = 1.0 },
+        .{ .cp = 'e', .score = 0.895, .second_cp = 'o', .second_score = 0.592, .gap_before = 2, .width = 7, .height = 6, .row_cov = 1.0 },
+    };
+    disambiguatePhrase(&file_tok, 4.3, 10.0, 19.0);
+    try std.testing.expectEqual(@as(u32, 'f'), file_tok[0].cp);
+
+    var admin_tok = [_]MatchedGlyph{
+        .{ .cp = 'a', .score = 0.820, .second_cp = 'e', .second_score = 0.411, .gap_before = 0, .width = 5, .height = 5, .row_cov = 1.0 },
+        .{ .cp = 'd', .score = 0.867, .second_cp = 'a', .second_score = 0.697, .gap_before = 2, .width = 5, .height = 8, .row_cov = 1.0 },
+        .{ .cp = '=', .score = 0.506, .second_cp = 'm', .second_score = 0.501, .gap_before = 0, .width = 8, .height = 5, .row_cov = 1.0 },
+        .{ .cp = 'i', .score = 0.874, .second_cp = 0x00ED, .second_score = 0.864, .gap_before = 1, .width = 5, .height = 8, .row_cov = 0.88 },
+        .{ .cp = 'n', .score = 0.866, .second_cp = 'm', .second_score = 0.698, .gap_before = 3, .width = 5, .height = 5, .row_cov = 1.0 },
+    };
+    disambiguatePhrase(&admin_tok, 4.3, 10.0, 18.0);
+    try std.testing.expectEqual(@as(u32, 'm'), admin_tok[2].cp);
 }
