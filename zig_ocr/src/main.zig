@@ -476,9 +476,21 @@ fn extractGlyphVecs(
 const MatchResult = struct {
     codepoint: u32,
     score: f32,
+    second_cp: u32,
+    second_score: f32,
 };
 
-/// Hot-path SIMD shape matcher (no self, primitive/slice args per TigerStyle).
+const MatchedGlyph = struct {
+    cp: u32,
+    score: f32,
+    second_cp: u32,
+    second_score: f32,
+    gap_before: f32,
+    width: u32,
+    height: u32,
+};
+
+/// Hot-path SIMD shape matcher returning top-2 distinct codepoints (no self, TigerStyle).
 fn matchGlyphSimd(
     templates: []const Template,
     q_vecs: *const [SIMD_CHUNKS]Vec16,
@@ -489,6 +501,8 @@ fn matchGlyphSimd(
 ) MatchResult {
     var best_cp: u32 = '?';
     var best_score: f32 = -10.0;
+    var second_cp: u32 = '?';
+    var second_score: f32 = -10.0;
 
     for (templates) |t| {
         // Fast geometric reject before SIMD dot product
@@ -505,12 +519,98 @@ fn matchGlyphSimd(
         const hole_pen: f32 = if (q_holes == t.holes) 0.0 else 0.10;
         const score = dot - 0.22 * aspect_diff - 0.28 * @min(y_diff, 1.5) - hole_pen;
         if (score > best_score) {
+            if (t.codepoint != best_cp) {
+                second_score = best_score;
+                second_cp = best_cp;
+            }
             best_score = score;
             best_cp = t.codepoint;
+        } else if (t.codepoint != best_cp and score > second_score) {
+            second_score = score;
+            second_cp = t.codepoint;
         }
     }
 
-    return .{ .codepoint = best_cp, .score = best_score };
+    return .{
+        .codepoint = best_cp,
+        .score = best_score,
+        .second_cp = second_cp,
+        .second_score = second_score,
+    };
+}
+
+fn isAsciiDigit(cp: u32) bool {
+    return cp >= '0' and cp <= '9';
+}
+
+fn isAsciiLower(cp: u32) bool {
+    return (cp >= 'a' and cp <= 'z') or cp == 0x00E1 or cp == 0x00E9 or cp == 0x00ED or cp == 0x00F3 or cp == 0x00FA or cp == 0x00F1 or cp == 0x00FC;
+}
+
+fn isAsciiAlpha(cp: u32) bool {
+    return isAsciiLower(cp) or (cp >= 'A' and cp <= 'Z') or cp == 0x00C1 or cp == 0x00C9 or cp == 0x00CD or cp == 0x00D3 or cp == 0x00DA or cp == 0x00D1;
+}
+
+/// Disambiguate isolated-glyph confusions (1/i/l/I and 0/O/o) using immediate token neighbors.
+fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32) void {
+    const n = glyphs.len;
+    if (n < 2) return;
+
+    for (0..n) |i| {
+        const g = &glyphs[i];
+        const has_left = (i > 0) and (g.gap_before < space_gap * 1.15);
+        const has_right = (i + 1 < n) and (glyphs[i + 1].gap_before < space_gap * 1.15);
+        const left_cp: u32 = if (has_left) glyphs[i - 1].cp else 0;
+        const right_cp: u32 = if (has_right) glyphs[i + 1].cp else 0;
+
+        const near_digit = isAsciiDigit(left_cp) or isAsciiDigit(right_cp);
+        const near_lower = isAsciiLower(left_cp) or isAsciiLower(right_cp);
+        const near_alpha = isAsciiAlpha(left_cp) or isAsciiAlpha(right_cp);
+
+        // 1) 'O' or 'o' inside a numeric token (e.g., 2O26, 11:O1) -> '0'
+        if ((g.cp == 'O' or g.cp == 'o') and (near_digit or ((left_cp == ':' or right_cp == ':') and !near_alpha))) {
+            if (g.second_cp == '0' or (g.score - g.second_score < 0.25)) {
+                g.cp = '0';
+            }
+            continue;
+        }
+
+        // 2) '0' inside a purely alphabetic word (e.g., C0DER, H0la) -> 'O' or 'o'
+        if (g.cp == '0' and near_alpha and !near_digit) {
+            if (g.second_cp == 'O' or g.second_cp == 'o') {
+                g.cp = g.second_cp;
+            } else {
+                g.cp = if (near_lower) 'o' else 'O';
+            }
+            continue;
+        }
+
+        // 3) '1' inside a lowercase alphabetic word (e.g., sal1da, d1spon1ble, 1sycode) -> 'i' or 'l'
+        if (g.cp == '1' and near_lower and !near_digit) {
+            if ((g.second_cp == 'i' or g.second_cp == 'l' or g.second_cp == 'I') and (g.score - g.second_score) <= 0.18) {
+                g.cp = g.second_cp;
+            } else {
+                g.cp = 'i';
+            }
+            continue;
+        }
+
+        // 4) 'l' or 'I' or '|' adjacent to digits without letters -> '1'
+        if ((g.cp == 'l' or g.cp == 'I' or g.cp == '|') and near_digit and !near_alpha) {
+            if (g.second_cp == '1' and (g.score - g.second_score) <= 0.20) {
+                g.cp = '1';
+            }
+            continue;
+        }
+    }
+}
+
+fn isTightRightPunct(cp: u32) bool {
+    return cp == '.' or cp == ',' or cp == ':' or cp == ';' or cp == '!' or cp == '?' or cp == ')' or cp == ']';
+}
+
+fn isTightLeftPunct(cp: u32) bool {
+    return cp == 0x00A1 or cp == 0x00BF or cp == '(' or cp == '[' or cp == '/';
 }
 
 fn compLessByY(_: void, a: Comp, b: Comp) bool {
@@ -711,20 +811,17 @@ fn recognizeLines(
             const space_gap: f32 = @max(3.0, @min(med_w * 0.48, ref_h * 0.34));
 
             phrase_buf.clearRetainingCapacity();
+            var matched = try std.ArrayList(MatchedGlyph).initCapacity(gpa, slice.len);
+            defer matched.deinit(gpa);
+
             var score_sum: f32 = 0.0;
             var min_score: f32 = 1.0;
-            var char_cnt: u32 = 0;
 
             for (slice, 0..) |g, gi| {
-                if (gi > 0) {
-                    const prev = slice[gi - 1];
-                    const gap: f32 = if (g.x0 > prev.x1) @floatFromInt(g.x0 - prev.x1) else 0.0;
-                    const narrow_punct = (prev.width() <= 3 and prev.height() <= 8) or (g.width() <= 3 and g.height() <= 8);
-                    const eff_space_gap = if (narrow_punct) space_gap * 1.45 else space_gap;
-                    if (gap >= eff_space_gap) {
-                        try phrase_buf.append(gpa, ' ');
-                    }
-                }
+                const gap: f32 = if (gi > 0 and g.x0 > slice[gi - 1].x1)
+                    @floatFromInt(g.x0 - slice[gi - 1].x1)
+                else
+                    0.0;
 
                 const q_vecs = extractGlyphVecs(fg, img.width, g.x0, g.y0, g.x1, g.y1);
                 const q_aspect = @as(f32, @floatFromInt(g.width())) / @as(f32, @floatFromInt(g.height()));
@@ -733,18 +830,48 @@ fn recognizeLines(
                 const q_holes = countHolesGlyph(mask, img.width, g.x0, g.y0, g.x1, g.y1);
 
                 const m = matchGlyphSimd(templates, &q_vecs, q_aspect, q_y_top, q_y_bot, q_holes);
-                var utf8_buf: [4]u8 = undefined;
-                const cp21: u21 = @intCast(m.codepoint);
-                const ulen = std.unicode.utf8Encode(cp21, &utf8_buf) catch 1;
-                try phrase_buf.appendSlice(gpa, utf8_buf[0..ulen]);
+                try matched.append(gpa, .{
+                    .cp = m.codepoint,
+                    .score = m.score,
+                    .second_cp = m.second_cp,
+                    .second_score = m.second_score,
+                    .gap_before = gap,
+                    .width = g.width(),
+                    .height = g.height(),
+                });
 
                 const clamped = std.math.clamp(m.score, 0.0, 1.0);
                 score_sum += clamped;
                 if (clamped < min_score) min_score = clamped;
-                char_cnt += 1;
             }
 
+            const char_cnt: u32 = @intCast(matched.items.len);
             if (char_cnt == 0) continue;
+
+            // Contextual disambiguation pass (1/i/l/I and 0/O/o within tokens)
+            disambiguatePhrase(matched.items, space_gap);
+
+            for (matched.items, 0..) |mg, gi| {
+                if (gi > 0) {
+                    const prev_mg = matched.items[gi - 1];
+                    const tight_punct = isTightRightPunct(mg.cp) or isTightLeftPunct(prev_mg.cp) or
+                        ((prev_mg.cp == '.' or prev_mg.cp == ':') and isAsciiDigit(mg.cp));
+                    const narrow_punct = (prev_mg.width <= 3 and prev_mg.height <= 8) or (mg.width <= 3 and mg.height <= 8);
+                    const eff_space_gap = if (tight_punct)
+                        space_gap * 1.85
+                    else if (narrow_punct)
+                        space_gap * 1.45
+                    else
+                        space_gap;
+                    if (mg.gap_before >= eff_space_gap) {
+                        try phrase_buf.append(gpa, ' ');
+                    }
+                }
+                var utf8_buf: [4]u8 = undefined;
+                const cp21: u21 = @intCast(mg.cp);
+                const ulen = std.unicode.utf8Encode(cp21, &utf8_buf) catch 1;
+                try phrase_buf.appendSlice(gpa, utf8_buf[0..ulen]);
+            }
             const mean_score = score_sum / @as(f32, @floatFromInt(char_cnt));
             // Filter out non-text UI icon noise
             if (mean_score < 0.45) continue;
@@ -888,4 +1015,26 @@ test "countHolesGlyph detects 0 holes in bar and 1 hole in ring" {
         0, 0, 0, 0, 0,
     };
     try std.testing.expectEqual(@as(u8, 1), countHolesGlyph(&ring, 5, 0, 0, 5, 4));
+}
+
+test "disambiguatePhrase fixes 2O26 -> 2026 and sal1da -> salida" {
+    var num_tok = [_]MatchedGlyph{
+        .{ .cp = '2', .score = 0.9, .second_cp = 'Z', .second_score = 0.6, .gap_before = 0, .width = 7, .height = 11 },
+        .{ .cp = 'O', .score = 0.88, .second_cp = '0', .second_score = 0.85, .gap_before = 1, .width = 7, .height = 11 },
+        .{ .cp = '2', .score = 0.9, .second_cp = 'Z', .second_score = 0.6, .gap_before = 1, .width = 7, .height = 11 },
+        .{ .cp = '6', .score = 0.9, .second_cp = 'G', .second_score = 0.6, .gap_before = 1, .width = 7, .height = 11 },
+    };
+    disambiguatePhrase(&num_tok, 4.0);
+    try std.testing.expectEqual(@as(u32, '0'), num_tok[1].cp);
+
+    var word_tok = [_]MatchedGlyph{
+        .{ .cp = 's', .score = 0.9, .second_cp = 'S', .second_score = 0.7, .gap_before = 0, .width = 6, .height = 8 },
+        .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.7, .gap_before = 1, .width = 6, .height = 8 },
+        .{ .cp = 'l', .score = 0.9, .second_cp = '1', .second_score = 0.8, .gap_before = 1, .width = 3, .height = 11 },
+        .{ .cp = '1', .score = 0.85, .second_cp = 'i', .second_score = 0.82, .gap_before = 1, .width = 3, .height = 11 },
+        .{ .cp = 'd', .score = 0.9, .second_cp = 'b', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 11 },
+        .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.7, .gap_before = 1, .width = 6, .height = 8 },
+    };
+    disambiguatePhrase(&word_tok, 4.0);
+    try std.testing.expectEqual(@as(u32, 'i'), word_tok[3].cp);
 }

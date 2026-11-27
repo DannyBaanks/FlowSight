@@ -1226,6 +1226,109 @@ def _format_control_line(c: dict[str, Any]) -> str:
     )
 
 
+def _detect_graphic_regions_no_text(ctx: FilterContext) -> list[dict]:
+    """Identify large non-text graphic/banner regions (many NO_TEXT controls or high-chroma band with 0 OCR)."""
+    ocr_items = ctx.artifacts.get('ocr', {}).get('items', [])
+    controls = ctx.artifacts.get('controls', {}).get('controls', [])
+    if not controls:
+        return []
+
+    # Cluster NO_TEXT_EVIDENCE controls that sit in a horizontal band (e.g., pixel-art banner/mosaic)
+    no_txt = [
+        c for c in controls
+        if c.get('association') == focr.ASSOC_NONE and c.get('text') is None
+    ]
+    if len(no_txt) < 3:
+        return []
+
+    # Group NO_TEXT controls by vertical proximity (gap <= 60px)
+    no_txt_sorted = sorted(no_txt, key=lambda c: c['global_bbox'][1])
+    clusters: list[list[dict]] = []
+    for c in no_txt_sorted:
+        cy0, cy1 = c['global_bbox'][1], c['global_bbox'][3]
+        if clusters and cy0 <= max(x['global_bbox'][3] for x in clusters[-1]) + 50:
+            clusters[-1].append(c)
+        else:
+            clusters.append([c])
+
+    regions = []
+    for cl in clusters:
+        if len(cl) < 3:
+            continue
+        x0 = min(c['global_bbox'][0] for c in cl)
+        y0 = min(c['global_bbox'][1] for c in cl)
+        x1 = max(c['global_bbox'][2] for c in cl)
+        y1 = max(c['global_bbox'][3] for c in cl)
+        bw, bh = x1 - x0, y1 - y0
+        if bw < 260 or bh < 60:
+            continue
+        # Count OCR items strictly inside this region
+        inside_ocr = 0
+        for it in ocr_items:
+            ob = it['bbox']
+            ocx = (ob[0] + ob[2]) * 0.5
+            ocy = (ob[1] + ob[3]) * 0.5
+            if x0 <= ocx <= x1 and y0 <= ocy <= y1:
+                inside_ocr += 1
+        if inside_ocr <= 1:
+            regions.append({
+                'bbox': [x0, y0, x1, y1],
+                'size': [bw, bh],
+                'no_text_controls': len(cl),
+                'ocr_items': inside_ocr,
+            })
+    return regions
+
+
+def _detect_top_chrome_structure(ctx: FilterContext) -> dict | None:
+    """Distinguish a top window title bar (y < 65) from a separate tab strip row (65 <= y < 125)."""
+    ocr_items = ctx.artifacts.get('ocr', {}).get('items', [])
+    if not ocr_items:
+        return None
+    top_items = [it for it in ocr_items if it['bbox'][1] < 120]
+    if len(top_items) < 2:
+        return None
+
+    # Exclude OS system clock / status bar at y < 28 and tiny icon/close-button glyphs (w < 45)
+    chrome_items = [
+        it for it in top_items
+        if it['bbox'][1] >= 28 and (it['bbox'][2] - it['bbox'][0]) >= 45 and len(it['text'].strip()) >= 4
+    ]
+    if len(chrome_items) < 2:
+        return None
+
+    # Cluster into horizontal rows by y-center within 16px
+    chrome_items.sort(key=lambda it: (it['bbox'][1] + it['bbox'][3]) * 0.5)
+    rows: list[list[dict]] = []
+    for it in chrome_items:
+        yc = (it['bbox'][1] + it['bbox'][3]) * 0.5
+        if rows:
+            prev_yc = sum((x['bbox'][1] + x['bbox'][3]) * 0.5 for x in rows[-1]) / len(rows[-1])
+            if abs(yc - prev_yc) <= 16.0:
+                rows[-1].append(it)
+                continue
+        rows.append([it])
+
+    if len(rows) < 2:
+        return None
+    title_row = rows[0]
+    tab_row = sorted(rows[1], key=lambda it: it['bbox'][0])
+    title_y = int(round(sum((x['bbox'][1] + x['bbox'][3]) * 0.5 for x in title_row) / len(title_row)))
+    tab_y = int(round(sum((x['bbox'][1] + x['bbox'][3]) * 0.5 for x in tab_row) / len(tab_row)))
+    if len(title_row) == 1 and len(tab_row) >= 2 and (tab_y - title_y) >= 20:
+        # Verify tabs are horizontally spread (not just one phrase split by gap)
+        gaps = [tab_row[i + 1]['bbox'][0] - tab_row[i]['bbox'][2] for i in range(len(tab_row) - 1)]
+        if all(g >= 80 for g in gaps):
+            return {
+                'title_y': title_y,
+                'title_text': title_row[0]['text'],
+                'tab_y': tab_y,
+                'tab_count': len(tab_row),
+                'tab_texts': [t['text'] for t in tab_row],
+            }
+    return None
+
+
 def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500, ocr_limit: int = 25) -> str:
     total_ms = round(sum(t['ms'] for t in ctx.trace), 2)
     chain = ' -> '.join(f'{t["filter"]}({t["ms"]}ms)' for t in ctx.trace)
@@ -1285,6 +1388,24 @@ def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500, ocr_limit:
                 out.append(f'  {a["ocr_id"]} text={a["text"]!r} bbox={a["bbox"]} reason={a["reason"]} candidates=[{c_str}]')
             if len(ambs) > 6:
                 out.append(f'  [TRUNCATED {len(ambs) - 6} of {len(ambs)} additional ambiguities]')
+
+    if 'ocr' in ctx.artifacts:
+        g_regions = _detect_graphic_regions_no_text(ctx)
+        if g_regions:
+            out.append('GRAPHIC REGIONS (NO READABLE TEXT — semantic content NOT_DEMONSTRATED without VLM):')
+            for gr in g_regions[:4]:
+                out.append(
+                    f'  bbox={gr["bbox"]} ({gr["size"][0]}x{gr["size"][1]}) '
+                    f'no_text_controls={gr["no_text_controls"]} ocr_items={gr["ocr_items"]} '
+                    '-> visual/graphic/pixel-art region; do NOT guess what it depicts'
+                )
+        chrome = _detect_top_chrome_structure(ctx)
+        if chrome:
+            out.append(
+                f'TOP CHROME STRUCTURE (DEMONSTRATED geometry): '
+                f'window_title_bar_y={chrome["title_y"]} (1 title: {chrome["title_text"]!r}) | '
+                f'tab_strip_y={chrome["tab_y"]} ({chrome["tab_count"]} tabs: {chrome["tab_texts"]!r})'
+            )
 
     if 'ocr' in ctx.artifacts:
         oc = ctx.artifacts['ocr']
@@ -1435,6 +1556,10 @@ def main(argv=None) -> int:
     p.add_argument('--json', action='store_true', help='Emit structured JSON instead of compact text')
     p.add_argument('--max-chars', type=int, default=6500)
     p.add_argument('--ocr-limit', type=int, default=25, help='Maximum OCR items printed in report (default: 25, max: 400)')
+    p.add_argument('--ocr-backend', default=None, choices=['auto', 'zig', 'rapidocr', 'tesseract'],
+                   help='Override OCR backend when ocr filter is used')
+    p.add_argument('--one-shot', action='store_true',
+                   help='Single-call full-screen preset: theme,layout,controls,ocr(zig if built),ui_map with max_chars>=16000 and ocr_limit>=150')
     p.add_argument('--filters', action='store_true', help='List available filters and exit')
     p.add_argument('--enable-vlm', action='store_true', help='Opt-in enable crop-only vlm_probe (or set FLOWSIGHT_VLM_ENABLED=1)')
     p.add_argument('--vlm-url', default=None, help='OpenAI-compatible VLM endpoint URL (or FLOWSIGHT_VLM_URL)')
@@ -1456,7 +1581,18 @@ def main(argv=None) -> int:
             allow_remote=True if args.vlm_allow_remote else None,
             timeout_s=args.vlm_timeout,
         )
-        ctx = run_pipeline(args.input, vf=args.vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
+        vf_str = args.vf
+        max_chars = args.max_chars
+        ocr_limit = args.ocr_limit
+        if args.one_shot:
+            eff_b = args.ocr_backend or ('zig' if focr.detect_zig_ocr_engine()[0] else 'auto')
+            vf_str = f'theme,layout,controls,ocr=backend={eff_b},ui_map'
+            max_chars = max(max_chars, 16000)
+            ocr_limit = max(ocr_limit, 150)
+        elif args.ocr_backend and 'ocr' in vf_str:
+            vf_str = re.sub(r'\bocr(?=(?:,|$))', f'ocr=backend={args.ocr_backend}', vf_str)
+
+        ctx = run_pipeline(args.input, vf=vf_str, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
         if args.json:
             payload = {
                 'schema': SCHEMA_SCREEN,
@@ -1469,7 +1605,7 @@ def main(argv=None) -> int:
             }
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
-            print(format_pipeline_report(ctx, max_chars=args.max_chars, ocr_limit=args.ocr_limit))
+            print(format_pipeline_report(ctx, max_chars=max_chars, ocr_limit=ocr_limit))
         return 0
     except (FilterDeny, fb.BlocksDeny, OSError) as e:
         print(f'DENY {e}', file=sys.stderr)
