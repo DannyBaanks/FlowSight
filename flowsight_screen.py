@@ -318,6 +318,123 @@ def _merge_1d_lines(indices: np.ndarray, min_gap: int = 8) -> list[int]:
     return [g[len(g) // 2] for g in groups]
 
 
+def _merge_1d_ranked(indices: np.ndarray, cov: np.ndarray, min_gap: int = 8, max_keep: int = 8) -> list[int]:
+    """Merge nearby 1D divider indices, rank groups by coverage strength, keep top max_keep, then sort by position."""
+    if indices.size == 0 or cov.size == 0:
+        return []
+    groups = [[int(indices[0])]]
+    for v in indices[1:]:
+        iv = int(v)
+        if iv - groups[-1][-1] <= min_gap:
+            groups[-1].append(iv)
+        else:
+            groups.append([iv])
+    scored = []
+    n_cov = len(cov)
+    for g in groups:
+        best_i = max(g, key=lambda idx: float(cov[min(max(0, idx - 1), n_cov - 1)]))
+        strength = max(float(cov[min(max(0, idx - 1), n_cov - 1)]) for idx in g)
+        scored.append((strength, best_i))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return sorted(idx for _, idx in scored[:max_keep])
+
+
+def _detect_morph_boxes(gray: np.ndarray, dy: np.ndarray, dx: np.ndarray) -> tuple[list[list[int]], set[int]]:
+    """Detect closed axis-aligned thin-bordered rectangles via morphological line extraction.
+    Returns (list of [x0, y0, x1, y1], set of row y indices that are borders of closed input/control boxes).
+    """
+    h, w = gray.shape
+    dy_bin = np.zeros((h, w), dtype=np.uint8)
+    dx_bin = np.zeros((h, w), dtype=np.uint8)
+    dy_bin[1:, :] = (dy >= 5.0).astype(np.uint8) * 255
+    dx_bin[:, 1:] = (dx >= 5.0).astype(np.uint8) * 255
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(24, w // 36), 1))
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, h // 72)))
+    h_lines = cv2.morphologyEx(dy_bin, cv2.MORPH_OPEN, hk)
+    v_lines = cv2.morphologyEx(dx_bin, cv2.MORPH_OPEN, vk)
+    h_d = cv2.dilate(h_lines, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)))
+    v_d = cv2.dilate(v_lines, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 9)))
+    grid = cv2.bitwise_or(h_d, v_d)
+    cnts, _ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: list[list[int]] = []
+    box_rows: set[int] = set()
+    for cnt in cnts:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw < 48 or bh < 18 or bh > h * 0.45:
+            continue
+        if bw > w * 0.98 and bh > h * 0.85:
+            continue
+        top_cov = float(np.mean(np.max(h_lines[max(0, y - 2):min(h, y + 4), x:x + bw], axis=0) > 0)) if bh > 4 else 0.0
+        bot_cov = float(np.mean(np.max(h_lines[max(0, y + bh - 4):min(h, y + bh + 2), x:x + bw], axis=0) > 0)) if bh > 4 else 0.0
+        left_cov = float(np.mean(np.max(v_lines[y:y + bh, max(0, x - 2):min(w, x + 4)], axis=1) > 0)) if bw > 4 else 0.0
+        right_cov = float(np.mean(np.max(v_lines[y:y + bh, max(0, x + bw - 4):min(w, x + bw + 2)], axis=1) > 0)) if bw > 4 else 0.0
+        if top_cov >= 0.65 and bot_cov >= 0.65 and left_cov >= 0.45 and right_cov >= 0.45:
+            boxes.append([x, y, x + bw, y + bh])
+            # Closed control boxes with left or right margin inside the screen are controls, not layout dividers
+            if bh <= 110 and (x >= 6 or x + bw <= w - 6):
+                for ry in range(max(0, y - 4), min(h, y + 5)):
+                    box_rows.add(ry)
+                for ry in range(max(0, y + bh - 5), min(h, y + bh + 4)):
+                    box_rows.add(ry)
+    return boxes, box_rows
+
+
+def _xy_cut_panels(
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    dy: np.ndarray,
+    dx: np.ndarray,
+    box_rows: set[int],
+    full_w: int,
+    full_h: int,
+    depth: int = 0,
+) -> list[list[int]]:
+    """Recursive XY-cut panel partitioning: splits a region only on dividers strong WITHIN that region."""
+    rw, rh = x1 - x0, y1 - y0
+    if depth >= 5 or rw < 48 or rh < 28:
+        return [[x0, y0, x1, y1]]
+    min_h_gap = max(12, full_h // 45)
+    min_v_gap = max(12, full_w // 45)
+
+    sub_dy = dy[y0:y1 - 1, x0:x1]
+    h_cov = np.mean(sub_dy >= 10.0, axis=1) if sub_dy.size > 0 else np.zeros(0)
+    for r in box_rows:
+        if y0 < r < y1 and 0 <= (r - y0 - 1) < len(h_cov):
+            h_cov[r - y0 - 1] = 0.0
+    h_thresh = 0.60 if depth == 0 else 0.68
+    h_idx = np.where(h_cov >= h_thresh)[0] + 1
+    h_idx = h_idx[(h_idx >= 12) & (h_idx <= rh - 12)]
+    h_splits = [y0 + int(y) for y in _merge_1d_ranked(h_idx, h_cov, min_gap=min_h_gap, max_keep=8)]
+
+    sub_dx = dx[y0:y1, x0:x1 - 1]
+    v_cov = np.mean(sub_dx >= 10.0, axis=0) if sub_dx.size > 0 else np.zeros(0)
+    v_thresh = 0.60 if depth == 0 else 0.68
+    v_idx = np.where(v_cov >= v_thresh)[0] + 1
+    v_idx = v_idx[(v_idx >= 12) & (v_idx <= rw - 12)]
+    v_splits = [x0 + int(x) for x in _merge_1d_ranked(v_idx, v_cov, min_gap=min_v_gap, max_keep=8)]
+
+    best_h = float(np.max(h_cov[h_idx - 1])) if len(h_splits) > 0 else 0.0
+    best_v = float(np.max(v_cov[v_idx - 1])) if len(v_splits) > 0 else 0.0
+
+    if not h_splits and not v_splits:
+        return [[x0, y0, x1, y1]]
+
+    out: list[list[int]] = []
+    if best_h >= best_v and h_splits:
+        ys = [y0] + h_splits + [y1]
+        for i in range(len(ys) - 1):
+            if ys[i + 1] - ys[i] >= 10:
+                out.extend(_xy_cut_panels(x0, ys[i], x1, ys[i + 1], dy, dx, box_rows, full_w, full_h, depth + 1))
+    else:
+        xs = [x0] + v_splits + [x1]
+        for i in range(len(xs) - 1):
+            if xs[i + 1] - xs[i] >= 16:
+                out.extend(_xy_cut_panels(xs[i], y0, xs[i + 1], y1, dy, dx, box_rows, full_w, full_h, depth + 1))
+    return out
+
+
 @register_filter(
     'layout',
     'Detect structural UI dividers (H/V splits) and panel/pane containers with global bboxes',
@@ -328,74 +445,46 @@ def _f_layout(ctx: FilterContext, params: dict[str, str]) -> None:
     h, w = ctx.h, ctx.w
     gray = cv2.cvtColor(ctx.rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
 
-    # Row-wise & col-wise edge continuity: real UI dividers create consistent transitions
-    # across a large fraction (>=42%) of the width or height.
     dy = np.abs(np.diff(gray, axis=0))  # (H-1, W)
     dx = np.abs(np.diff(gray, axis=1))  # (H, W-1)
 
-    h_cov = np.mean(dy >= 10.0, axis=1)  # fraction of columns with vertical contrast at row y
-    v_cov = np.mean(dx >= 10.0, axis=0)  # fraction of rows with horizontal contrast at col x
+    _, box_rows = _detect_morph_boxes(gray, dy, dx)
 
-    # Also check color-uniform strip transitions (flat bar edges)
+    h_cov = np.mean(dy >= 10.0, axis=1)
+    v_cov = np.mean(dx >= 10.0, axis=0)
+    for r in box_rows:
+        if 0 <= r - 1 < len(h_cov):
+            h_cov[r - 1] = 0.0
+
     h_idx = np.where(h_cov >= 0.42)[0] + 1
     v_idx = np.where(v_cov >= 0.42)[0] + 1
-
-    # Ignore edges within 4px of border
     h_idx = h_idx[(h_idx >= 12) & (h_idx <= h - 12)]
     v_idx = v_idx[(v_idx >= 12) & (v_idx <= w - 12)]
-    h_divs = _merge_1d_lines(h_idx, min_gap=max(12, h // 45))[:8]
-    v_divs = _merge_1d_lines(v_idx, min_gap=max(12, w // 45))[:8]
 
-    ys = [0] + h_divs + [h]
-    xs = [0] + v_divs + [w]
+    # Rank by coverage strength first, keep top 8, then sort by position
+    h_divs = _merge_1d_ranked(h_idx, h_cov, min_gap=max(12, h // 45), max_keep=8)
+    v_divs = _merge_1d_ranked(v_idx, v_cov, min_gap=max(12, w // 45), max_keep=8)
 
-    # Build grid cells from dividers, then merge adjacent cells that share nearly identical
-    # background color AND lack a strong divider between them on that local segment.
-    cells = []
-    for ri in range(len(ys) - 1):
-        y0, y1 = ys[ri], ys[ri + 1]
-        if y1 - y0 < 10:
-            continue
-        for ci in range(len(xs) - 1):
-            x0, x1 = xs[ci], xs[ci + 1]
-            if x1 - x0 < 16:
-                continue
-            patch = ctx.rgb[y0:y1, x0:x1]
-            # Background estimate = median RGB of patch
-            med_rgb = [int(np.median(patch[:, :, c])) for c in range(3)]
-            luma = round(0.299 * med_rgb[0] + 0.587 * med_rgb[1] + 0.114 * med_rgb[2], 1)
-            gpatch = gray[y0:y1, x0:x1]
-            std_l = round(float(np.std(gpatch)), 1)
-            area_pct = round((x1 - x0) * (y1 - y0) * 100.0 / (w * h), 1)
-            cells.append({
-                'local': [x0, y0, x1, y1],
-                'ri': ri, 'ci': ci,
-                'bg_rgb': med_rgb,
-                'luma': luma,
-                'std_luma': std_l,
-                'area_pct': area_pct,
-            })
+    # Recursive XY-cut so local dividers in main pane never slice across sidebars
+    xy_rects = _xy_cut_panels(0, 0, w, h, dy, dx, box_rows, w, h, depth=0)
 
-    # Merge horizontal spans when top/bottom bands are uniform across V-dividers (e.g. topbar/statusbar)
     merged_rows = []
-    by_row: dict[int, list[dict]] = {}
-    for c in cells:
-        by_row.setdefault(c['ri'], []).append(c)
-    for ri in sorted(by_row):
-        row_cells = sorted(by_row[ri], key=lambda z: z['local'][0])
-        cur = row_cells[0]
-        for nxt in row_cells[1:]:
-            y0, y1 = cur['local'][1], cur['local'][3]
-            seam_x = cur['local'][2]
-            local_seam = float(np.mean(dx[y0:y1, max(0, seam_x - 1)] >= 10.0)) if seam_x < w else 1.0
-            cdiff = sum(abs(cur['bg_rgb'][k] - nxt['bg_rgb'][k]) for k in range(3)) / 3.0
-            if local_seam < 0.35 and cdiff <= 18.0:
-                cur['local'][2] = nxt['local'][2]
-                cur['area_pct'] = round(cur['area_pct'] + nxt['area_pct'], 1)
-            else:
-                merged_rows.append(cur)
-                cur = nxt
-        merged_rows.append(cur)
+    for x0, y0, x1, y1 in xy_rects:
+        if y1 - y0 < 10 or x1 - x0 < 16:
+            continue
+        patch = ctx.rgb[y0:y1, x0:x1]
+        med_rgb = [int(np.median(patch[:, :, c])) for c in range(3)]
+        luma = round(0.299 * med_rgb[0] + 0.587 * med_rgb[1] + 0.114 * med_rgb[2], 1)
+        gpatch = gray[y0:y1, x0:x1]
+        std_l = round(float(np.std(gpatch)), 1)
+        area_pct = round((x1 - x0) * (y1 - y0) * 100.0 / (w * h), 1)
+        merged_rows.append({
+            'local': [x0, y0, x1, y1],
+            'bg_rgb': med_rgb,
+            'luma': luma,
+            'std_luma': std_l,
+            'area_pct': area_pct,
+        })
 
     # Positional geometric hint (pure geometry, NEVER an app/semantic claim)
     panels = []
@@ -432,6 +521,7 @@ def _f_layout(ctx: FilterContext, params: dict[str, str]) -> None:
         'v_dividers_global_x': [ctx.offset_x + x for x in v_divs],
         'panels': panels,
         'total_panels_detected': len(merged_rows),
+        'truncated': max(0, len(merged_rows) - len(panels)),
     }
 
 
@@ -445,13 +535,49 @@ def _f_controls(ctx: FilterContext, params: dict[str, str]) -> None:
     h, w = ctx.h, ctx.w
     hsv = cv2.cvtColor(ctx.rgb, cv2.COLOR_RGB2HSV)
     gray = cv2.cvtColor(ctx.rgb, cv2.COLOR_RGB2GRAY)
+    gray_f = gray.astype(np.float32)
     panels = ctx.artifacts.get('layout', {}).get('panels', [])
 
     candidates: list[dict[str, Any]] = []
 
-    # 1. Accent-colored filled rectangles/pills (buttons, primary CTAs, alert banners, badges)
-    # High saturation AND non-black value
+    # Detect high-color-variance graphic/image regions (e.g., pixel-art banners or photos)
+    # where small saturated blobs are visual art rather than interactive UI controls.
+    # True dark UI backgrounds have low HSV Value (<45) even if Saturation is high, so require V >= 70.
+    image_regions: list[list[int]] = []
     sat_mask = ((hsv[:, :, 1] >= 85) & (hsv[:, :, 2] >= 70)).astype(np.uint8) * 255
+    hue_q = (hsv[:, :, 0] // 20) + 1  # 1..9 hue buckets
+    bright_hue = np.where((hsv[:, :, 1] >= 85) & (hsv[:, :, 2] >= 70), hue_q, 0)
+    k_img = cv2.getStructuringElement(cv2.MORPH_RECT, (max(32, w // 24), max(16, h // 36)))
+    img_Grouping = cv2.morphologyEx(sat_mask, cv2.MORPH_CLOSE, k_img)
+    icnts, _ = cv2.findContours(img_Grouping, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in icnts:
+        ix, iy, ibw, ibh = cv2.boundingRect(cnt)
+        if ibw >= w * 0.25 and 40 <= ibh <= h * 0.45 and ibw * ibh >= w * h * 0.03:
+            sub_bh = bright_hue[iy:iy + ibh:2, ix:ix + ibw:2]
+            bright_frac = float(np.mean(sub_bh > 0))
+            distinct_hues = len(np.unique(sub_bh[sub_bh > 0]))
+            if bright_frac >= 0.15 and distinct_hues >= 4:
+                image_regions.append([ix, iy, ix + ibw, iy + ibh])
+                sub_rgb = ctx.rgb[iy:iy + ibh:2, ix:ix + ibw:2]
+                med = [int(np.median(sub_rgb[:, :, c])) for c in range(3)]
+                candidates.append({
+                    'local': [ix, iy, ix + ibw, iy + ibh],
+                    'kind': 'image-region',
+                    'hex': _hex(med),
+                    'family': fb._hsv_family(*med),
+                    'fill_ratio': round(bright_frac, 2),
+                    'has_inner_contrast': True,
+                    'priority': 1,
+                    'score': float(ibw * ibh),
+                })
+
+    def _in_image_region(box: list[int]) -> bool:
+        for ir in image_regions:
+            if _box_contains(ir, box, min_overlap=0.50):
+                return True
+        return False
+
+    # 1. Accent-colored filled rectangles/pills (buttons, primary CTAs, alert banners, badges)
     k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
     sat_closed = cv2.morphologyEx(sat_mask, cv2.MORPH_CLOSE, k_close)
     cnts, _ = cv2.findContours(sat_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -467,11 +593,14 @@ def _f_controls(ctx: FilterContext, params: dict[str, str]) -> None:
             continue
         patch = ctx.rgb[y:y + bh, x:x + bw]
         med = [int(np.median(patch[:, :, c])) for c in range(3)]
-        # Internal horizontal contrast -> likely text/icon label inside button
-        gpatch = gray[y:y + bh, x:x + bw].astype(np.float32)
+        gpatch = gray_f[y:y + bh, x:x + bw]
         inner_dx = np.abs(np.diff(gpatch[2:-2, 2:-2], axis=1)) if (bh > 6 and bw > 6) else np.zeros((1, 1))
         has_label = bool(np.mean(inner_dx >= 28.0) >= 0.025)
         kind = 'badge' if (bw < 64 and bh < 32) else 'accent-control'
+        in_img = _in_image_region([x, y, x + bw, y + bh])
+        # Downweight saturated blobs inside high-color-variance image/banner regions
+        prio = 2 if in_img else 0
+        sc = area * (1.5 if has_label else 1.0) * (0.05 if in_img else 1.0)
         candidates.append({
             'local': [x, y, x + bw, y + bh],
             'kind': kind,
@@ -479,20 +608,23 @@ def _f_controls(ctx: FilterContext, params: dict[str, str]) -> None:
             'family': fb._hsv_family(*med),
             'fill_ratio': round(fill_ratio, 2),
             'has_inner_contrast': has_label,
-            'score': area * (1.5 if has_label else 1.0),
+            'priority': prio,
+            'score': sc,
         })
 
-    # 2. Sharp bordered rectangular boxes (inputs, search bars, secondary buttons, modal cards)
+    # 2. Sharp bordered rectangular boxes (Canny + Morphological line extraction for 1px/wide inputs)
     edges = cv2.Canny(gray, 35, 110)
     k_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     edges_d = cv2.dilate(edges, k_dil, iterations=1)
     cnts2, _ = cv2.findContours(edges_d, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    raw_rect_boxes: list[tuple[int, int, int, int, float]] = []
     for cnt in cnts2:
         x, y, bw, bh = cv2.boundingRect(cnt)
         area = bw * bh
-        if bw < 48 or bh < 20 or bw > w * 0.80 or bh > h * 0.50:
+        if bw < 48 or bh < 18 or bw > w * 0.99 or bh > h * 0.50:
             continue
-        if area < 1200 or area > w * h * 0.35:
+        if area < 1000 or area > w * h * 0.45:
             continue
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.025 * peri, True)
@@ -501,19 +633,35 @@ def _f_controls(ctx: FilterContext, params: dict[str, str]) -> None:
         rect_ratio = float(cv2.contourArea(cnt)) / max(1.0, float(area))
         if rect_ratio < 0.84:
             continue
-        # Verify border is actually distinct from its immediate outside margin
+        raw_rect_boxes.append((x, y, bw, bh, rect_ratio))
+
+    dy = np.abs(np.diff(gray_f, axis=0))
+    dx = np.abs(np.diff(gray_f, axis=1))
+    morph_boxes, _ = _detect_morph_boxes(gray_f, dy, dx)
+    for x0, y0, x1, y1 in morph_boxes:
+        raw_rect_boxes.append((x0, y0, x1 - x0, y1 - y0, 0.96))
+
+    for x, y, bw, bh, rect_ratio in raw_rect_boxes:
+        area = bw * bh
+        # Never discard wide bordered inputs; only skip small/tall sub-rectangles inside an image-region
+        if _in_image_region([x, y, x + bw, y + bh]) and not (bh <= 64 and bw >= w * 0.25):
+            continue
         patch = ctx.rgb[y + 2:y + bh - 2, x + 2:x + bw - 2] if (bh > 6 and bw > 6) else ctx.rgb[y:y + bh, x:x + bw]
         med = [int(np.median(patch[:, :, c])) for c in range(3)]
-        gpatch = gray[y:y + bh, x:x + bw].astype(np.float32)
+        gpatch = gray_f[y:y + bh, x:x + bw]
         inner_dx = np.abs(np.diff(gpatch[3:-3, 3:-3], axis=1)) if (bh > 8 and bw > 8) else np.zeros((1, 1))
-        has_label = bool(np.mean(inner_dx >= 24.0) >= 0.015)
+        has_label = bool(np.mean(inner_dx >= 20.0) >= 0.010)
         aspect = bw / max(1.0, float(bh))
-        if bh <= 52 and aspect >= 2.6:
+        if bh <= 64 and aspect >= 2.6:
             kind = 'input-or-bar-box'
-        elif bh <= 60 and bw <= 280:
+        elif bh <= 64 and bw <= 280:
             kind = 'bordered-control'
         else:
             kind = 'card-or-dialog'
+        # Rank bordered inputs with inner text in the top priority tier so they are never starved
+        is_primary_input = (kind == 'input-or-bar-box' and (has_label or bw >= w * 0.25))
+        prio = 0 if is_primary_input else 1
+        sc = area * (2.5 if is_primary_input else (1.2 if kind != 'card-or-dialog' else 0.7))
         candidates.append({
             'local': [x, y, x + bw, y + bh],
             'kind': kind,
@@ -521,17 +669,18 @@ def _f_controls(ctx: FilterContext, params: dict[str, str]) -> None:
             'family': fb._hsv_family(*med),
             'fill_ratio': round(rect_ratio, 2),
             'has_inner_contrast': has_label,
-            'score': area * (1.2 if kind != 'card-or-dialog' else 0.7),
+            'priority': prio,
+            'score': sc,
         })
 
-    # Non-maximum suppression (deduplicate overlapping detections IoU >= 0.65; prefer accent-control)
-    candidates.sort(key=lambda c: (0 if 'accent' in c['kind'] else 1, -c['score']))
-    kept: list[dict[str, Any]] = []
+    # Non-maximum suppression (deduplicate overlapping detections IoU >= 0.55)
+    candidates.sort(key=lambda c: (c['priority'], -c['score']))
+    deduped: list[dict[str, Any]] = []
     for cand in candidates:
         lx0, ly0, lx1, ly1 = cand['local']
         la = (lx1 - lx0) * (ly1 - ly0)
         dup = False
-        for prev in kept:
+        for prev in deduped:
             px0, py0, px1, py1 = prev['local']
             ix0, iy0 = max(lx0, px0), max(ly0, py0)
             ix1, iy1 = min(lx1, px1), min(ly1, py1)
@@ -539,14 +688,17 @@ def _f_controls(ctx: FilterContext, params: dict[str, str]) -> None:
                 inter = (ix1 - ix0) * (iy1 - iy0)
                 pa = (px1 - px0) * (py1 - py0)
                 iou = inter / max(1, la + pa - inter)
-                if iou >= 0.60:
+                # Also suppress thin inner/outer double-border duplicates of the exact same box
+                near_border = (abs(lx0 - px0) <= 6 and abs(ly0 - py0) <= 6 and abs(lx1 - px1) <= 6 and abs(ly1 - py1) <= 6)
+                if iou >= 0.55 or near_border:
                     dup = True
                     break
         if not dup:
-            kept.append(cand)
+            deduped.append(cand)
 
+    total_detected = len(deduped)
     # Sort top-to-bottom, left-to-right for human/agent readability
-    kept = kept[:max_controls]
+    kept = deduped[:max_controls]
     kept.sort(key=lambda c: (c['local'][1] // 16, c['local'][0]))
 
     controls = []
@@ -572,7 +724,9 @@ def _f_controls(ctx: FilterContext, params: dict[str, str]) -> None:
         })
 
     ctx.artifacts['controls'] = {
-        'total_detected': len(kept),
+        'total_detected': total_detected,
+        'shown': len(controls),
+        'truncated': max(0, total_detected - len(controls)),
         'controls': controls,
     }
 
@@ -1072,7 +1226,7 @@ def _format_control_line(c: dict[str, Any]) -> str:
     )
 
 
-def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
+def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500, ocr_limit: int = 25) -> str:
     total_ms = round(sum(t['ms'] for t in ctx.trace), 2)
     chain = ' -> '.join(f'{t["filter"]}({t["ms"]}ms)' for t in ctx.trace)
     out = [
@@ -1094,34 +1248,71 @@ def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
 
     if 'layout' in ctx.artifacts:
         lay = ctx.artifacts['layout']
+        shown_p = len(lay['panels'])
+        total_p = lay['total_panels_detected']
         out.append(
             f'LAYOUT (DEMONSTRATED dividers & panes): H_div_y={lay["h_dividers_global_y"]} '
-            f'V_div_x={lay["v_dividers_global_x"]} | panels={len(lay["panels"])}/{lay["total_panels_detected"]}:'
+            f'V_div_x={lay["v_dividers_global_x"]} | panels={shown_p}/{total_p}:'
         )
         for p in lay['panels']:
             out.append(
                 f'  {p["id"]:<3s} {p["position_hint"]:<18s} bbox={p["global_bbox"]} '
                 f'({p["size"][0]}x{p["size"][1]}, {p["area_pct"]}%) bg={p["bg_hex"]}({p["bg_family"]}) L={p["luma"]}'
             )
+        if total_p > shown_p:
+            out.append(f'  [TRUNCATED {total_p - shown_p} of {total_p} additional panels; raise max_panels or use crop=x:y:w:h]')
 
     if 'controls' in ctx.artifacts:
         ct = ctx.artifacts['controls']
-        out.append(f'CONTROLS (DEMONSTRATED geometric candidates — appearance != verified interactivity, total={ct["total_detected"]}):')
+        shown_c = len(ct['controls'])
+        total_c = ct['total_detected']
+        out.append(
+            f'CONTROLS (DEMONSTRATED geometric candidates — appearance != verified interactivity, '
+            f'showing={shown_c}/{total_c}, total={total_c}):'
+        )
         for c in ct['controls']:
             out.append('  ' + _format_control_line(c))
+        if total_c > shown_c:
+            out.append(f'  [TRUNCATED {total_c - shown_c} of {total_c} additional controls; raise controls=max=N or use crop=x:y:w:h]')
 
     if 'text_control_association' in ctx.artifacts:
         tca = ctx.artifacts['text_control_association']
         if tca['ambiguities']:
-            out.append(f'AMBIGUOUS TEXT-CONTROL ASSOCIATIONS ({len(tca["ambiguities"])}, NO arbitrary winner chosen):')
-            for a in tca['ambiguities'][:6]:
+            ambs = tca['ambiguities']
+            out.append(f'AMBIGUOUS TEXT-CONTROL ASSOCIATIONS ({len(ambs)}, NO arbitrary winner chosen):')
+            for a in ambs[:6]:
                 c_str = ', '.join(f'{cand["control_id"]}({cand.get("relation","overlap")})' for cand in a['candidates'][:3])
                 out.append(f'  {a["ocr_id"]} text={a["text"]!r} bbox={a["bbox"]} reason={a["reason"]} candidates=[{c_str}]')
+            if len(ambs) > 6:
+                out.append(f'  [TRUNCATED {len(ambs) - 6} of {len(ambs)} additional ambiguities]')
+
+    if 'ocr' in ctx.artifacts:
+        oc = ctx.artifacts['ocr']
+        st = oc['status']
+        if st in (focr.OCR_ABSENT, focr.OCR_ERROR):
+            out.append(f'OCR: status={st} engine={oc.get("engine")} ({oc["detail"]})')
+        else:
+            items = oc.get('items', [])
+            lim = max(1, min(400, int(ocr_limit)))
+            out.append(
+                f'OCR: status={st} engine={oc.get("engine")} lang={oc.get("lang")} '
+                f'scale={oc.get("confidence_scale")} items={len(items)} ({oc.get("elapsed_ms")}ms):'
+            )
+            for ln in items[:lim]:
+                out.append(f'  {ln["id"]:<3s} [{ln["status"]}] bbox={ln["bbox"]} conf={ln["confidence"]} text={ln["text"]!r}')
+            if len(items) > lim:
+                out.append(f'  [TRUNCATED {len(items) - lim} of {len(items)} additional OCR items; raise ocr_limit or use crop=x:y:w:h]')
+
+    if 'ui_map' in ctx.artifacts:
+        um = ctx.artifacts['ui_map']
+        out.append(f'UI WIREFRAME MAP {um["size"][0]}x{um["size"][1]} ({um["legend"]}):')
+        for ln in um['lines']:
+            out.append('  ' + ln)
 
     if 'text_bands' in ctx.artifacts:
         tb = ctx.artifacts['text_bands']
         out.append(
-            f'TEXT BANDS (GEOMETRIC ONLY, no OCR; showing {tb["shown"]}/{tb["total_detected"]}):'
+            f'TEXT BANDS (GEOMETRIC ONLY, no OCR; showing {min(20, tb["shown"])}/{tb["total_detected"]}):'
         )
         for b in tb['bands'][:20]:
             loc = f'control={b["inside_control"]}' if b['inside_control'] else f'panel={b["inside_panel"]}'
@@ -1130,26 +1321,7 @@ def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
                 f'trans={b["transitions"]} contrast={b["contrast"]} {loc}'
             )
         if tb['total_detected'] > 20:
-            out.append(f'  [TRUNCATED {tb["total_detected"] - 20} additional text bands; use crop=x:y:w:h to inspect]')
-
-    if 'ocr' in ctx.artifacts:
-        oc = ctx.artifacts['ocr']
-        st = oc['status']
-        if st in (focr.OCR_ABSENT, focr.OCR_ERROR):
-            out.append(f'OCR: status={st} engine={oc.get("engine")} ({oc["detail"]})')
-        else:
-            out.append(
-                f'OCR: status={st} engine={oc.get("engine")} lang={oc.get("lang")} '
-                f'scale={oc.get("confidence_scale")} items={len(oc.get("items", []))} ({oc.get("elapsed_ms")}ms):'
-            )
-            for ln in oc.get('items', [])[:25]:
-                out.append(f'  {ln["id"]:<3s} [{ln["status"]}] bbox={ln["bbox"]} conf={ln["confidence"]} text={ln["text"]!r}')
-
-    if 'ui_map' in ctx.artifacts:
-        um = ctx.artifacts['ui_map']
-        out.append(f'UI WIREFRAME MAP {um["size"][0]}x{um["size"][1]} ({um["legend"]}):')
-        for ln in um['lines']:
-            out.append('  ' + ln)
+            out.append(f'  [TRUNCATED {tb["total_detected"] - 20} of {tb["total_detected"]} additional text bands; use crop=x:y:w:h to inspect]')
 
     if 'ui_diff' in ctx.artifacts:
         df = ctx.artifacts['ui_diff']
@@ -1225,7 +1397,19 @@ def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500) -> str:
     text = '\n'.join(out)
     if len(text) > max_chars:
         suf = '\n[TRUNCATED: narrow scope with crop=x:y:w:h or select fewer filters in -vf]'
-        text = text[:max(0, max_chars - len(suf))] + suf
+        budget = max(0, max_chars - len(suf))
+        kept_lines: list[str] = []
+        used = 0
+        for ln in out:
+            add_len = len(ln) + (1 if kept_lines else 0)
+            if used + add_len > budget:
+                break
+            kept_lines.append(ln)
+            used += add_len
+        if kept_lines:
+            text = '\n'.join(kept_lines) + suf
+        else:
+            text = text[:budget] + suf
     return text
 
 
@@ -1250,6 +1434,7 @@ def main(argv=None) -> int:
                    help='Comma-separated filter chain (default: theme,layout,controls,text_bands,ui_map=48:20)')
     p.add_argument('--json', action='store_true', help='Emit structured JSON instead of compact text')
     p.add_argument('--max-chars', type=int, default=6500)
+    p.add_argument('--ocr-limit', type=int, default=25, help='Maximum OCR items printed in report (default: 25, max: 400)')
     p.add_argument('--filters', action='store_true', help='List available filters and exit')
     p.add_argument('--enable-vlm', action='store_true', help='Opt-in enable crop-only vlm_probe (or set FLOWSIGHT_VLM_ENABLED=1)')
     p.add_argument('--vlm-url', default=None, help='OpenAI-compatible VLM endpoint URL (or FLOWSIGHT_VLM_URL)')
@@ -1284,7 +1469,7 @@ def main(argv=None) -> int:
             }
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
-            print(format_pipeline_report(ctx, max_chars=args.max_chars))
+            print(format_pipeline_report(ctx, max_chars=args.max_chars, ocr_limit=args.ocr_limit))
         return 0
     except (FilterDeny, fb.BlocksDeny, OSError) as e:
         print(f'DENY {e}', file=sys.stderr)
