@@ -1622,7 +1622,13 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
                 const ny1 = @max(c.y1, prev.y1);
                 const v_overlap = @min(c.y1, prev.y1) > @max(c.y0, prev.y0) + 1;
                 const v_gap: u32 = if (c.y0 > prev.y1) c.y0 - prev.y1 else if (prev.y0 > c.y1) prev.y0 - c.y1 else 0;
-                if (!v_overlap and horiz_aligned and v_gap <= 7 and (ny1 - ny0) <= 30 and (nx1 - nx0) <= 22) {
+                // A tiny fragment lying inside another component's column range is already covered by
+                // that box (matching reads fg over the whole box): Noto 13px "key:value", where the
+                // colon's top dot touches the 'v' and its bottom dot re-appeared as a stray '.'.
+                const c_inside = c.area <= 6 and c.x0 >= prev.x0 and c.x1 <= prev.x1 and prev.area >= c.area * 3;
+                const p_inside = prev.area <= 6 and prev.x0 >= c.x0 and prev.x1 <= c.x1 and c.area >= prev.area * 3;
+                const tiny_inside = (c_inside or p_inside) and v_overlap and (nx1 - nx0) <= 22;
+                if (tiny_inside or (!v_overlap and horiz_aligned and v_gap <= 7 and (ny1 - ny0) <= 30 and (nx1 - nx0) <= 22)) {
                     prev.x0 = nx0;
                     prev.y0 = ny0;
                     prev.x1 = nx1;
