@@ -1732,25 +1732,6 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
             // and dropped real 4px word spaces (SettingsWindow, vectorand). 0.31 breaks mono 16px.
             var space_gap: f32 = @max(3.2, @min(med_w * 0.52, ref_h * 0.33));
 
-            // Monospace adaptive spacing: only when glyph widths are uniform (fixed-pitch cells
-            // around narrow letters like r/t/i) scale space threshold above intra-word padding.
-            if (is_monospace_like) {
-                tmp_u32.clearRetainingCapacity();
-                for (1..slice.len) |gi| {
-                    if (slice[gi].x0 > slice[gi - 1].x1) {
-                        const gpx = slice[gi].x0 - slice[gi - 1].x1;
-                        if (gpx > 0 and gpx <= 12) tmp_u32.append(gpa, gpx) catch return;
-                    }
-                }
-                if (tmp_u32.items.len >= 4) {
-                    std.mem.sort(u32, tmp_u32.items, {}, u32Less);
-                    const med_gap: f32 = @floatFromInt(tmp_u32.items[tmp_u32.items.len / 2]);
-                    if (med_gap >= 2.0) {
-                        space_gap = @max(space_gap, med_gap * 2.15);
-                    }
-                }
-            }
-
             // Fixed pitch: glyph centre-to-centre advances are near-constant (mono cells). Proportional
             // text mixes narrow (i, l, t) and wide (m, w) advances. Touching glyphs only occur in the latter.
             var fixed_pitch = false;
@@ -1774,6 +1755,28 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
                         if (d <= 3) at_pitch += 1;
                     }
                     fixed_pitch = at_pitch * 10 >= tmp_u32.items.len * 7;
+                }
+            }
+
+            // Monospace adaptive spacing: require BOTH uniform widths (is_monospace_like) AND
+            // fixed-pitch centre advances (fixed_pitch) so proportional sans (Ubuntu 16, Noto 14)
+            // never get their space threshold inflated by med_gap * 2.15.
+            var is_mono_spacing = false;
+            if (is_monospace_like and fixed_pitch) {
+                tmp_u32.clearRetainingCapacity();
+                for (1..slice.len) |gi| {
+                    if (slice[gi].x0 > slice[gi - 1].x1) {
+                        const gpx = slice[gi].x0 - slice[gi - 1].x1;
+                        if (gpx > 0 and gpx <= 12) tmp_u32.append(gpa, gpx) catch return;
+                    }
+                }
+                if (tmp_u32.items.len >= 4) {
+                    std.mem.sort(u32, tmp_u32.items, {}, u32Less);
+                    const med_gap: f32 = @floatFromInt(tmp_u32.items[tmp_u32.items.len / 2]);
+                    if (med_gap >= 2.0) {
+                        is_mono_spacing = true;
+                        space_gap = @max(space_gap, med_gap * 2.15);
+                    }
                 }
             }
 
@@ -1835,7 +1838,7 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
                         mg.width <= 3 and mg.height <= 8;
                     const narrow_punct = !is_bullet and (prev_is_narrow_punct or cur_is_narrow_punct);
                     const narrow_digit_1 = isAsciiDigit(prev_mg.cp) and isAsciiDigit(mg.cp) and (prev_mg.cp == '1' or mg.cp == '1');
-                    const narrow_pair = (is_monospace_like or fixed_pitch) and !is_bullet and
+                    const narrow_pair = is_mono_spacing and !is_bullet and
                         ((prev_mg.width <= 3 and mg.width <= 3) or (med_w >= 7.0 and (prev_mg.width <= 3 or mg.width <= 3)));
                     const is_ellipsis = (prev_mg.cp == '.' and mg.cp == '.');
                     const eff_space_gap = if (is_ellipsis)
