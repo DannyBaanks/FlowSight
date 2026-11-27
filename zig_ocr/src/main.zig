@@ -855,6 +855,9 @@ const MatchedGlyph = struct {
     height: u32,
     y0: u32 = 0,
     y1: u32 = 0,
+    /// Set when case was decided from phrase-level x-height/cap-height geometry; later
+    /// neighbor-based case heuristics must not override it.
+    case_locked: bool = false,
 };
 
 inline fn dotI8Simd(q: *const TemplateVec, t: *const TemplateVec) f32 {
@@ -1224,11 +1227,75 @@ fn isAsciiAlpha(cp: u32) bool {
     return isAsciiLower(cp) or isAsciiUpper(cp);
 }
 
+/// Letters whose upper and lower case share one normalized shape and differ only in height
+/// (both sit on the baseline, no ascender/descender difference). P/p and K/k are excluded:
+/// they differ by descender/ascender, not by height.
+fn isHeightOnlyCasePair(cp: u32) bool {
+    return switch (cp) {
+        'c', 'o', 's', 'v', 'w', 'x', 'z', 'u', 'C', 'O', 'S', 'V', 'W', 'X', 'Z', 'U' => true,
+        else => false,
+    };
+}
+
+fn medianSmall(vals: []u32) f32 {
+    std.mem.sort(u32, vals, {}, u32Less);
+    const m = vals.len / 2;
+    if (vals.len % 2 == 1) return @floatFromInt(vals[m]);
+    return (@as(f32, @floatFromInt(vals[m - 1])) + @as(f32, @floatFromInt(vals[m]))) * 0.5;
+}
+
+/// Decide the case of height-only case pairs (C/c, O/o, S/s, ...) from the phrase's own
+/// x-height (a e m n r) and cap height (distinct capitals, digits). Ascenders (b d h l) are NOT
+/// cap references: at small sizes they are often 1-2 px taller than capitals.
+/// The atlas normalizes glyph boxes, so the matcher cannot tell these apart by shape.
+/// Without an x-height reference nothing is decided (the neighbor heuristics still apply).
+fn resolveSameShapeCase(glyphs: []MatchedGlyph) void {
+    var xs: [64]u32 = undefined;
+    var cs: [64]u32 = undefined;
+    var nx: usize = 0;
+    var nc: usize = 0;
+    for (glyphs) |g| {
+        switch (g.cp) {
+            'a', 'e', 'm', 'n', 'r' => if (nx < xs.len) {
+                xs[nx] = g.height;
+                nx += 1;
+            },
+            'A', 'B', 'D', 'E', 'F', 'G', 'H', 'L', 'M', 'N', 'R', 'T', '2', '3', '4', '5', '6', '7', '9' => if (nc < cs.len) {
+                cs[nc] = g.height;
+                nc += 1;
+            },
+            else => {},
+        }
+    }
+    if (nx == 0) return;
+    const xh = medianSmall(xs[0..nx]);
+    // Typical sans/mono cap-height / x-height ratio is ~1.33-1.40; used only when no capital is present.
+    const ch = if (nc > 0) medianSmall(cs[0..nc]) else xh * 1.37;
+    if (ch < xh + 1.5) return; // not separable at this size (or references are wrong)
+    const mid = (xh + ch) * 0.5;
+    for (glyphs) |*g| {
+        if (!isHeightOnlyCasePair(g.cp)) continue;
+        // Round letters overshoot both lines by ~1px; the x refs (a e) partly overshoot too.
+        const round = switch (g.cp) {
+            'c', 'o', 's', 'C', 'O', 'S' => true,
+            else => false,
+        };
+        const thr = if (round) mid + 0.5 else mid;
+        const h: f32 = @floatFromInt(g.height);
+        const lower = h <= thr;
+        const is_up = g.cp >= 'A' and g.cp <= 'Z';
+        if (lower and is_up) g.cp += 32;
+        if (!lower and !is_up) g.cp -= 32;
+        g.case_locked = true;
+    }
+}
+
 /// Disambiguate isolated-glyph confusions (¡/i, 8/g, 1/i/l/I, 0/O/o, í/i, I/l/i, and same-shape case)
 /// using immediate token neighbors and baseline/cap-height geometry.
 fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_bot: f32) void {
     const n = glyphs.len;
     if (n < 2) return;
+    resolveSameShapeCase(glyphs);
 
     for (0..n) |i| {
         const g = &glyphs[i];
@@ -1328,7 +1395,7 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
 
         // 5) Same-shape uppercase inside a lowercase word (e.g., DeSCribe, BuSCar, archiVOs, ComandoS)
         //    Only lowercases when NOT at word start, OR when at word start with same x-height as right lowercase neighbor.
-        if (isSameShapeUpper(g.cp) and near_lower) {
+        if (isSameShapeUpper(g.cp) and near_lower and !g.case_locked) {
             const left_is_distinct_upper = has_left and isAsciiUpper(left_cp) and !isSameShapeUpper(left_cp);
             const right_is_distinct_upper = has_right and isAsciiUpper(right_cp) and !isSameShapeUpper(right_cp);
             if (!left_is_distinct_upper and !right_is_distinct_upper) {
@@ -1342,16 +1409,6 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
                 if (has_left and has_right and isAsciiLower(right_cp)) {
                     const rh = glyphs[i + 1].height;
                     if (g.height <= rh + 1) {
-                        g.cp = g.cp + 32;
-                        continue;
-                    }
-                }
-                // At word start, lowercase same-shape letter if clearly sitting at x-height (below cap-top)
-                const ref_h: f32 = @max(6.0, ref_bot - ref_top);
-                if (!has_left and has_right and isAsciiLower(right_cp) and g.y0 > 0 and ref_h >= 7.0) {
-                    const rh = glyphs[i + 1].height;
-                    const at_x_height = @as(f32, @floatFromInt(g.y0)) >= ref_top + ref_h * 0.14;
-                    if (at_x_height and g.height <= rh + 1 and @as(f32, @floatFromInt(g.height)) <= ref_h * 0.82) {
                         g.cp = g.cp + 32;
                         continue;
                     }
@@ -1372,7 +1429,7 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
 
         // 6) Same-shape lowercase inside an ALL-CAPS token (e.g., FL0WsIGHT -> FLOWSIGHT)
         //    Only uppercases when height matches the uppercase neighbors (never uppercases x-height 'u' in 'BuSCar').
-        if (isSameShapeLower(g.cp) and has_left and has_right and isAsciiUpper(left_cp) and isAsciiUpper(right_cp)) {
+        if (isSameShapeLower(g.cp) and !g.case_locked and has_left and has_right and isAsciiUpper(left_cp) and isAsciiUpper(right_cp)) {
             if (g.height + 1 >= glyphs[i - 1].height and g.height + 1 >= glyphs[i + 1].height) {
                 g.cp = g.cp - 32;
                 continue;
@@ -2249,4 +2306,25 @@ test "disambiguatePhrase fixes 2O26 -> 2026 and sal1da -> salida" {
     try std.testing.expectEqual(@as(u32, 'l'), fs_tok[1].cp);
     try std.testing.expectEqual(@as(u32, 'i'), fs_tok[5].cp);
     try std.testing.expectEqual(@as(u32, 'g'), fs_tok[6].cp);
+}
+
+test "resolveSameShapeCase keeps capitals when ascenders are taller than caps (DejaVu 13px)" {
+    // Heights measured on DejaVuSans 13px "Cosas Sobre Otros": caps 9, x-height 7, 'b' ascender 11.
+    var tok = [_]MatchedGlyph{
+        .{ .cp = 'c', .score = 0.9, .second_cp = 'C', .second_score = 0.89, .gap_before = 0, .width = 7, .height = 9 },
+        .{ .cp = 'o', .score = 0.9, .second_cp = 'O', .second_score = 0.89, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 'S', .score = 0.9, .second_cp = 's', .second_score = 0.89, .gap_before = 1, .width = 5, .height = 7 },
+        .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 's', .score = 0.9, .second_cp = 'S', .second_score = 0.89, .gap_before = 1, .width = 5, .height = 7 },
+        .{ .cp = 's', .score = 0.9, .second_cp = 'S', .second_score = 0.89, .gap_before = 6, .width = 6, .height = 9 },
+        .{ .cp = 'o', .score = 0.9, .second_cp = 'O', .second_score = 0.89, .gap_before = 1, .width = 6, .height = 7 },
+        .{ .cp = 'b', .score = 0.9, .second_cp = 'h', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 11 },
+        .{ .cp = 'r', .score = 0.9, .second_cp = 't', .second_score = 0.6, .gap_before = 1, .width = 4, .height = 7 },
+        .{ .cp = 'e', .score = 0.9, .second_cp = 'c', .second_score = 0.6, .gap_before = 1, .width = 6, .height = 7 },
+    };
+    disambiguatePhrase(&tok, 4.0, 10.0, 21.0);
+    try std.testing.expectEqual(@as(u32, 'C'), tok[0].cp);
+    try std.testing.expectEqual(@as(u32, 'o'), tok[1].cp);
+    try std.testing.expectEqual(@as(u32, 's'), tok[2].cp);
+    try std.testing.expectEqual(@as(u32, 'S'), tok[5].cp);
 }
