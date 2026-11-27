@@ -1828,6 +1828,25 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
                         space_gap = @max(space_gap, med_gap * 2.15);
                     }
                 }
+            } else if (ref_h >= 11.5) {
+                // Wide-tracked / thin-stroke proportional fonts at >=16px (e.g. Ubuntu 16px) have
+                // 2-4px intra-word gaps while real word spaces are 5-6px; raise space_gap above 4px
+                // when intra-word gaps (1..4px, excluding word spaces) have median >= 2 and p75 >= 3.
+                tmp_u32.clearRetainingCapacity();
+                for (1..slice.len) |gi| {
+                    if (slice[gi].x0 > slice[gi - 1].x1) {
+                        const gpx = slice[gi].x0 - slice[gi - 1].x1;
+                        if (gpx > 0 and gpx <= 4) tmp_u32.append(gpa, gpx) catch return;
+                    }
+                }
+                if (tmp_u32.items.len >= 6) {
+                    std.mem.sort(u32, tmp_u32.items, {}, u32Less);
+                    const med_g = tmp_u32.items[tmp_u32.items.len / 2];
+                    const p75_g = tmp_u32.items[(tmp_u32.items.len * 3) / 4];
+                    if (med_g >= 2 and p75_g >= 3) {
+                        space_gap = @max(space_gap, 4.1);
+                    }
+                }
             }
 
             phrase_buf.clearRetainingCapacity();
