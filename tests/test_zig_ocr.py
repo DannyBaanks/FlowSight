@@ -62,3 +62,24 @@ def test_oneshot_report_detects_top_chrome_tabs(tmp_path):
     assert "TOP CHROME STRUCTURE" in rep
     assert "2 tabs" in rep
 
+
+@pytest.mark.skipif(not _has_zig_ocr(), reason="flowsight-ocr-zig binary or atlas.fsoa not built")
+def test_zig_ocr_preserves_hyphens_underscores_and_stacked_lines():
+    img = Image.new("RGB", (640, 140), (18, 22, 30))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
+    draw.text((20, 20), "2026-11-27 11:38", fill=(230, 236, 245), font=font)
+    draw.text((20, 38), "isycode_mcp_execute", fill=(230, 236, 245), font=font)
+    draw.text((20, 56), "Buscar archivos...", fill=(230, 236, 245), font=font)
+
+    rgb = np.asarray(img, dtype=np.uint8)
+    res = flowsight_ocr.run_ocr(rgb, 0, 0, "stacked_zig", backend="zig")
+    assert res["status"] == flowsight_ocr.OCR_OBSERVED
+    texts = [it["text"] for it in res["items"]]
+    assert len(texts) == 3, f"expected 3 separate lines, got {texts}"
+    assert "2026-11-27 11:38" in texts[0]
+    assert "sycode_mcp_execute" in texts[1]
+    assert "Buscar arch" in texts[2] and "..." in texts[2]
+    assert "S" not in texts[2] and "C" not in texts[2] and "V" not in texts[2]
+
+

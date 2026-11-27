@@ -116,7 +116,12 @@ fn loadAtlas(gpa: std.mem.Allocator, raw: []const u8) ![]Template {
             .vecs = vecs,
         };
     }
+    std.mem.sort(Template, templates, {}, templateLessByAspect);
     return templates;
+}
+
+fn templateLessByAspect(_: void, a: Template, b: Template) bool {
+    return a.aspect < b.aspect;
 }
 
 fn skipPgmWsAndComments(data: []const u8, idx: *usize) void {
@@ -209,6 +214,7 @@ fn computeForeground(
             }
             const bg: i32 = if (best_cnt > 0) @intCast(hist_sum[best_bin] / best_cnt) else 0;
 
+            var tile_max_diff: u32 = 0;
             y = y_start;
             while (y < y_end) : (y += 1) {
                 const row_off = @as(usize, y) * @as(usize, img.width);
@@ -218,7 +224,19 @@ fn computeForeground(
                     const diff: u32 = @abs(p - bg);
                     const d8: u8 = @intCast(@min(diff, 255));
                     fg[row_off + x] = d8;
-                    mask[row_off + x] = if (d8 >= 36) 1 else 0;
+                    if (d8 > tile_max_diff) tile_max_diff = d8;
+                }
+            }
+
+            // Adaptive per-tile threshold: 30% of local peak contrast (floor 36) breaks AA halos
+            // between adjacent bright glyphs while preserving muted/dim placeholder text.
+            const thr: u8 = @intCast(@max(@as(u32, 36), (tile_max_diff * 30) / 100));
+            y = y_start;
+            while (y < y_end) : (y += 1) {
+                const row_off = @as(usize, y) * @as(usize, img.width);
+                var x = x_start;
+                while (x < x_end) : (x += 1) {
+                    mask[row_off + x] = if (fg[row_off + x] >= thr) 1 else 0;
                 }
             }
         }
@@ -301,8 +319,10 @@ fn extractComponents(
             const bw = max_x - min_x + 1;
             const bh = max_y - min_y + 1;
 
-            // Keep glyph-sized components, reject UI boxes/borders/lines
-            if (bw == 0 or bh < 2) continue;
+            // Keep glyph-sized components, reject UI boxes/borders/lines.
+            // Allow 1px-tall dashes/underscores (-, _) of width 3..14.
+            if (bw == 0 or bh == 0) continue;
+            if (bh == 1 and (bw < 3 or bw > 14)) continue;
             if (bw > 44 or bh > 40) continue;
             if (bw > 24 and bh <= 3) continue;
             if (bh > 24 and bw <= 3) continue;
@@ -490,7 +510,7 @@ const MatchedGlyph = struct {
     height: u32,
 };
 
-/// Hot-path SIMD shape matcher returning top-2 distinct codepoints (no self, TigerStyle).
+/// Hot-path SIMD shape matcher returning top-2 distinct codepoints (aspect-indexed).
 fn matchGlyphSimd(
     templates: []const Template,
     q_vecs: *const [SIMD_CHUNKS]Vec16,
@@ -499,23 +519,43 @@ fn matchGlyphSimd(
     q_y_bot: f32,
     q_holes: u8,
 ) MatchResult {
+    const aspect_win: f32 = 0.35;
+    const min_aspect = q_aspect - aspect_win;
+    const max_aspect = q_aspect + aspect_win;
+
+    // Binary search for first template with t.aspect >= min_aspect
+    var lo: usize = 0;
+    var hi: usize = templates.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (templates[mid].aspect < min_aspect) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
     var best_cp: u32 = '?';
     var best_score: f32 = -10.0;
     var second_cp: u32 = '?';
     var second_score: f32 = -10.0;
 
-    for (templates) |t| {
-        // Fast geometric reject before SIMD dot product
-        const aspect_diff = @abs(q_aspect - t.aspect);
-        if (aspect_diff > 1.2) continue;
+    var idx = lo;
+    while (idx < templates.len) : (idx += 1) {
+        const t = templates[idx];
+        if (t.aspect > max_aspect) break;
 
+        // Pre-SIMD vertical reject (avoids touching 768B template vecs)
+        const y_diff = (@abs(q_y_top - t.y_top) + @abs(q_y_bot - t.y_bot)) * 0.5;
+        if (y_diff > 0.85) continue;
+
+        const aspect_diff = @abs(q_aspect - t.aspect);
         var acc: Vec16 = @splat(0.0);
         inline for (0..SIMD_CHUNKS) |c| {
             acc += q_vecs[c] * t.vecs[c];
         }
         const dot: f32 = @reduce(.Add, acc);
 
-        const y_diff = (@abs(q_y_top - t.y_top) + @abs(q_y_bot - t.y_bot)) * 0.5;
         const hole_pen: f32 = if (q_holes == t.holes) 0.0 else 0.10;
         const score = dot - 0.22 * aspect_diff - 0.28 * @min(y_diff, 1.5) - hole_pen;
         if (score > best_score) {
@@ -531,12 +571,215 @@ fn matchGlyphSimd(
         }
     }
 
+    // Rare fallback for extreme aspect ratios (e.g. wide dashes)
+    if (best_score <= -9.0) {
+        for (templates) |t| {
+            const aspect_diff = @abs(q_aspect - t.aspect);
+            if (aspect_diff > 1.6) continue;
+            var acc: Vec16 = @splat(0.0);
+            inline for (0..SIMD_CHUNKS) |c| {
+                acc += q_vecs[c] * t.vecs[c];
+            }
+            const dot: f32 = @reduce(.Add, acc);
+            const y_diff = (@abs(q_y_top - t.y_top) + @abs(q_y_bot - t.y_bot)) * 0.5;
+            const hole_pen: f32 = if (q_holes == t.holes) 0.0 else 0.10;
+            const score = dot - 0.22 * aspect_diff - 0.28 * @min(y_diff, 1.5) - hole_pen;
+            if (score > best_score) {
+                if (t.codepoint != best_cp) {
+                    second_score = best_score;
+                    second_cp = best_cp;
+                }
+                best_score = score;
+                best_cp = t.codepoint;
+            } else if (t.codepoint != best_cp and score > second_score) {
+                second_score = score;
+                second_cp = t.codepoint;
+            }
+        }
+    }
+
     return .{
         .codepoint = best_cp,
         .score = best_score,
         .second_cp = second_cp,
         .second_score = second_score,
     };
+}
+
+fn trimVerticalBounds(fg: []const u8, img_w: u32, x0: u32, y0: u32, x1: u32, y1: u32) struct { y0: u32, y1: u32, ok: bool } {
+    var ny0: u32 = y1;
+    var ny1: u32 = y0;
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        const row_off = @as(usize, y) * @as(usize, img_w);
+        var x = x0;
+        while (x < x1) : (x += 1) {
+            if (fg[row_off + x] >= 36) {
+                if (y < ny0) ny0 = y;
+                if (y + 1 > ny1) ny1 = y + 1;
+                break;
+            }
+        }
+    }
+    if (ny1 <= ny0) return .{ .y0 = y0, .y1 = y1, .ok = false };
+    return .{ .y0 = ny0, .y1 = ny1, .ok = true };
+}
+
+fn matchBox(
+    fg: []const u8,
+    mask: []const u8,
+    img_w: u32,
+    templates: []const Template,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    ref_top: f32,
+    ref_h: f32,
+) MatchResult {
+    const bw = x1 - x0;
+    const bh = y1 - y0;
+    const q_vecs = extractGlyphVecs(fg, img_w, x0, y0, x1, y1);
+    const q_aspect = @as(f32, @floatFromInt(bw)) / @as(f32, @floatFromInt(bh));
+    const q_y_top = (@as(f32, @floatFromInt(y0)) - ref_top) / ref_h;
+    const q_y_bot = (@as(f32, @floatFromInt(y1)) - ref_top) / ref_h;
+    const q_holes = countHolesGlyph(mask, img_w, x0, y0, x1, y1);
+    return matchGlyphSimd(templates, &q_vecs, q_aspect, q_y_top, q_y_bot, q_holes);
+}
+
+/// Match a component, splitting touching glyphs along vertical ink valleys when two halves score better.
+fn matchOrSplitGlyph(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(MatchedGlyph),
+    fg: []const u8,
+    mask: []const u8,
+    img_w: u32,
+    templates: []const Template,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    gap_before: f32,
+    ref_top: f32,
+    ref_h: f32,
+    depth: u8,
+) !void {
+    const bw = x1 - x0;
+    const bh = y1 - y0;
+    const single = matchBox(fg, mask, img_w, templates, x0, y0, x1, y1, ref_top, ref_h);
+    const q_aspect = @as(f32, @floatFromInt(bw)) / @as(f32, @floatFromInt(bh));
+
+    const is_wide_single = (single.codepoint == 'm' or single.codepoint == 'w' or single.codepoint == 'M' or single.codepoint == 'W');
+    const can_try_split = (depth < 2) and (bw >= 10) and (bh >= 5) and (bw <= 48) and (q_aspect >= 1.00) and
+        ((!is_wide_single and single.score < 0.80) or (is_wide_single and single.score < 0.72));
+
+    if (can_try_split) {
+        var col_sum: [48]u32 = .{0} ** 48;
+        var x: u32 = 0;
+        while (x < bw) : (x += 1) {
+            var s: u32 = 0;
+            var y = y0;
+            while (y < y1) : (y += 1) {
+                s += fg[@as(usize, y) * @as(usize, img_w) + (x0 + x)];
+            }
+            col_sum[x] = s;
+        }
+
+        // Collect up to 2 deepest local-minimum valleys (separated by >= 3px) and pick the highest-scoring split
+        var cand_sx: [2]u32 = .{ 0, 0 };
+        var cand_val: [2]u32 = .{ std.math.maxInt(u32), std.math.maxInt(u32) };
+        var cand_cnt: usize = 0;
+
+        var sx: u32 = 3;
+        while (sx + 3 <= bw) : (sx += 1) {
+            var lmax: u32 = 0;
+            for (0..sx) |lx| {
+                if (col_sum[lx] > lmax) lmax = col_sum[lx];
+            }
+            var rmax: u32 = 0;
+            for (sx + 1..bw) |rx| {
+                if (col_sum[rx] > rmax) rmax = col_sum[rx];
+            }
+            const side_min = @min(lmax, rmax);
+            if (side_min < 120) continue;
+            if (col_sum[sx] * 10 > side_min * 7) continue; // not a real valley
+            // Prefer local minima
+            if (col_sum[sx] > col_sum[sx - 1] or col_sum[sx] > col_sum[sx + 1]) continue;
+
+            // Merge with an existing nearby candidate (< 3px away) if deeper
+            var replaced_near = false;
+            for (0..cand_cnt) |ci| {
+                const dist = if (sx > cand_sx[ci]) sx - cand_sx[ci] else cand_sx[ci] - sx;
+                if (dist < 3) {
+                    if (col_sum[sx] < cand_val[ci]) {
+                        cand_sx[ci] = sx;
+                        cand_val[ci] = col_sum[sx];
+                    }
+                    replaced_near = true;
+                    break;
+                }
+            }
+            if (replaced_near) continue;
+
+            if (cand_cnt < 2) {
+                cand_sx[cand_cnt] = sx;
+                cand_val[cand_cnt] = col_sum[sx];
+                cand_cnt += 1;
+            } else {
+                const worst_i: usize = if (cand_val[0] >= cand_val[1]) 0 else 1;
+                if (col_sum[sx] < cand_val[worst_i]) {
+                    cand_sx[worst_i] = sx;
+                    cand_val[worst_i] = col_sum[sx];
+                }
+            }
+        }
+
+        var best_split_x: u32 = 0;
+        var best_split_mean: f32 = -10.0;
+        var best_lb_y0: u32 = y0;
+        var best_lb_y1: u32 = y1;
+        var best_rb_y0: u32 = y0;
+        var best_rb_y1: u32 = y1;
+
+        for (0..cand_cnt) |ci| {
+            const split_x = x0 + cand_sx[ci];
+            const lb = trimVerticalBounds(fg, img_w, x0, y0, split_x, y1);
+            const rb = trimVerticalBounds(fg, img_w, split_x, y0, x1, y1);
+            if (lb.ok and rb.ok and (lb.y1 - lb.y0) >= 2 and (rb.y1 - rb.y0) >= 2) {
+                const lm = matchBox(fg, mask, img_w, templates, x0, lb.y0, split_x, lb.y1, ref_top, ref_h);
+                const rm = matchBox(fg, mask, img_w, templates, split_x, rb.y0, x1, rb.y1, ref_top, ref_h);
+                const mean_lr = (lm.score + rm.score) * 0.5;
+                const min_lr = @min(lm.score, rm.score);
+                const margin: f32 = if (is_wide_single) 0.07 else 0.025;
+                const accept = (min_lr >= 0.42 and mean_lr > single.score + margin) or
+                    (single.score < 0.62 and min_lr >= 0.45 and mean_lr > single.score - 0.02);
+                if (accept and mean_lr > best_split_mean) {
+                    best_split_mean = mean_lr;
+                    best_split_x = split_x;
+                    best_lb_y0 = lb.y0;
+                    best_lb_y1 = lb.y1;
+                    best_rb_y0 = rb.y0;
+                    best_rb_y1 = rb.y1;
+                }
+            }
+        }
+
+        if (best_split_x > x0) {
+            try matchOrSplitGlyph(gpa, out, fg, mask, img_w, templates, x0, best_lb_y0, best_split_x, best_lb_y1, gap_before, ref_top, ref_h, depth + 1);
+            try matchOrSplitGlyph(gpa, out, fg, mask, img_w, templates, best_split_x, best_rb_y0, x1, best_rb_y1, 0.0, ref_top, ref_h, depth + 1);
+            return;
+        }
+    }
+
+    try out.append(gpa, .{
+        .cp = single.codepoint,
+        .score = single.score,
+        .second_cp = single.second_cp,
+        .second_score = single.second_score,
+        .gap_before = gap_before,
+        .width = bw,
+        .height = bh,
+    });
 }
 
 fn isAsciiDigit(cp: u32) bool {
@@ -547,11 +790,23 @@ fn isAsciiLower(cp: u32) bool {
     return (cp >= 'a' and cp <= 'z') or cp == 0x00E1 or cp == 0x00E9 or cp == 0x00ED or cp == 0x00F3 or cp == 0x00FA or cp == 0x00F1 or cp == 0x00FC;
 }
 
-fn isAsciiAlpha(cp: u32) bool {
-    return isAsciiLower(cp) or (cp >= 'A' and cp <= 'Z') or cp == 0x00C1 or cp == 0x00C9 or cp == 0x00CD or cp == 0x00D3 or cp == 0x00DA or cp == 0x00D1;
+fn isAsciiUpper(cp: u32) bool {
+    return (cp >= 'A' and cp <= 'Z') or cp == 0x00C1 or cp == 0x00C9 or cp == 0x00CD or cp == 0x00D3 or cp == 0x00DA or cp == 0x00D1;
 }
 
-/// Disambiguate isolated-glyph confusions (1/i/l/I and 0/O/o) using immediate token neighbors.
+fn isSameShapeUpper(cp: u32) bool {
+    return cp == 'C' or cp == 'O' or cp == 'S' or cp == 'V' or cp == 'W' or cp == 'X' or cp == 'Z' or cp == 'U' or cp == 'P' or cp == 'K';
+}
+
+fn isSameShapeLower(cp: u32) bool {
+    return cp == 'c' or cp == 'o' or cp == 's' or cp == 'v' or cp == 'w' or cp == 'x' or cp == 'z' or cp == 'u' or cp == 'p' or cp == 'k';
+}
+
+fn isAsciiAlpha(cp: u32) bool {
+    return isAsciiLower(cp) or isAsciiUpper(cp);
+}
+
+/// Disambiguate isolated-glyph confusions (1/i/l/I, 0/O/o, í/i, and same-shape case) using immediate token neighbors.
 fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32) void {
     const n = glyphs.len;
     if (n < 2) return;
@@ -565,7 +820,14 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32) void {
 
         const near_digit = isAsciiDigit(left_cp) or isAsciiDigit(right_cp);
         const near_lower = isAsciiLower(left_cp) or isAsciiLower(right_cp);
-        const near_alpha = isAsciiAlpha(left_cp) or isAsciiAlpha(right_cp);
+        const near_upper = isAsciiUpper(left_cp) or isAsciiUpper(right_cp);
+        const near_alpha = near_lower or near_upper;
+
+        // 0) Weak 'í' vs 'i' confusion on mono fonts where i-dot slightly resembles acute accent
+        if (g.cp == 0x00ED and g.second_cp == 'i' and (g.score - g.second_score) < 0.035) {
+            g.cp = 'i';
+            continue;
+        }
 
         // 1) 'O' or 'o' inside a numeric token (e.g., 2O26, 11:O1) -> '0'
         if ((g.cp == 'O' or g.cp == 'o') and (near_digit or ((left_cp == ':' or right_cp == ':') and !near_alpha))) {
@@ -601,6 +863,38 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32) void {
                 g.cp = '1';
             }
             continue;
+        }
+
+        // 5) Same-shape uppercase inside a lowercase word (e.g., DeSCribe, BuSCar, archiVOs, ComandoS)
+        //    Only lowercases when NOT at word start, OR when at word start with same x-height as right lowercase neighbor.
+        if (isSameShapeUpper(g.cp) and near_lower) {
+            const left_is_distinct_upper = has_left and isAsciiUpper(left_cp) and !isSameShapeUpper(left_cp);
+            const right_is_distinct_upper = has_right and isAsciiUpper(right_cp) and !isSameShapeUpper(right_cp);
+            if (!left_is_distinct_upper and !right_is_distinct_upper) {
+                if (has_left and isAsciiLower(left_cp)) {
+                    const lh = glyphs[i - 1].height;
+                    if (g.height <= lh + 1) {
+                        g.cp = g.cp + 32;
+                        continue;
+                    }
+                }
+                if (has_left and has_right and isAsciiLower(right_cp)) {
+                    const rh = glyphs[i + 1].height;
+                    if (g.height <= rh + 1) {
+                        g.cp = g.cp + 32;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 6) Same-shape lowercase inside an ALL-CAPS token (e.g., FL0WsIGHT -> FLOWSIGHT)
+        //    Only uppercases when height matches the uppercase neighbors (never uppercases x-height 'u' in 'BuSCar').
+        if (isSameShapeLower(g.cp) and has_left and has_right and isAsciiUpper(left_cp) and isAsciiUpper(right_cp)) {
+            if (g.height + 1 >= glyphs[i - 1].height and g.height + 1 >= glyphs[i + 1].height) {
+                g.cp = g.cp - 32;
+                continue;
+            }
         }
     }
 }
@@ -648,10 +942,17 @@ fn recognizeLines(
 
     std.mem.sort(Comp, comps.items, {}, compLessByY);
 
-    // Band clustering by vertical proximity
+    // Baseline-anchored anti-snowball band clustering (2-pass: normal glyphs first, then small diacritics/punct)
     const Band = struct {
+        x0: u32,
+        x1: u32,
         y0: u32,
         y1: u32,
+        core_sum_cy: f32,
+        core_sum_y1: f32,
+        core_sum_h: f32,
+        core_cnt: u32,
+        merged: bool = false,
         indices: std.ArrayList(usize),
     };
     var bands = try std.ArrayList(Band).initCapacity(gpa, 128);
@@ -660,38 +961,132 @@ fn recognizeLines(
         bands.deinit(gpa);
     }
 
+    var small_indices = try std.ArrayList(usize).initCapacity(gpa, 256);
+    defer small_indices.deinit(gpa);
+
+    // Pass 1: Cluster normal-height glyphs (>= 5px) using baseline (y1) + descender-aware fit
     for (comps.items, 0..) |c, ci| {
-        var placed = false;
-        // Search recent bands from the end (sorted by y0)
+        const ch = c.height();
+        const cw = c.width();
+        if (ch <= 5 and cw <= 14) {
+            try small_indices.append(gpa, ci);
+            continue;
+        }
+        const c_cy = c.cy();
+        const c_y1: f32 = @floatFromInt(c.y1);
+
+        var best_bi: ?usize = null;
+        var best_err: f32 = 1e9;
+
         var bi: usize = bands.items.len;
         while (bi > 0) {
             bi -= 1;
             const b = &bands.items[bi];
-            if (c.y0 > b.y1 + 10) break;
-            const ov_top = @max(c.y0, b.y0);
-            const ov_bot = @min(c.y1, b.y1);
-            const band_h = b.y1 - b.y0;
-            const c_cy = c.cy();
-            const b_cy = (@as(f32, @floatFromInt(b.y0)) + @as(f32, @floatFromInt(b.y1))) * 0.5;
-            const close_y = @abs(c_cy - b_cy) <= @max(7.0, @as(f32, @floatFromInt(band_h)) * 0.65);
-            const overlaps = ov_bot > ov_top;
-            // Allow small diacritic dots just above or below a band
-            const is_diacritic = (c.height() <= 6 and c.width() <= 10 and
-                ((c.y1 <= b.y0 + 3 and b.y0 <= c.y1 + 6) or (c.y0 + 3 >= b.y1 and c.y0 <= b.y1 + 5)));
-            if ((overlaps and close_y) or is_diacritic) {
-                if (!is_diacritic) {
-                    if (c.y0 < b.y0) b.y0 = c.y0;
-                    if (c.y1 > b.y1) b.y1 = c.y1;
+            if (c.y0 > b.y1 + 12) break;
+
+            const b_cy: f32 = b.core_sum_cy / @as(f32, @floatFromInt(b.core_cnt));
+            const b_y1: f32 = b.core_sum_y1 / @as(f32, @floatFromInt(b.core_cnt));
+            const b_h: f32 = std.math.clamp(b.core_sum_h / @as(f32, @floatFromInt(b.core_cnt)), 6.0, 22.0);
+
+            const dy_base = @abs(c_y1 - b_y1);
+            const dy_cy = @abs(c_cy - b_cy);
+            const core_top = b_y1 - b_h * 1.25;
+            const core_bot = b_y1 + b_h * 0.45;
+            const ov_top = @max(@as(f32, @floatFromInt(c.y0)), core_top);
+            const ov_bot = @min(@as(f32, @floatFromInt(c.y1)), core_bot);
+
+            // Same line iff baselines align (within 3.5px), OR descender starts inside x-height and drops <= 0.5*b_h below baseline
+            const same_baseline = dy_base <= @max(3.5, b_h * 0.30);
+            const descender_fit = (c_y1 > b_y1 and c_y1 <= b_y1 + @max(5.5, b_h * 0.50) and
+                @as(f32, @floatFromInt(c.y0)) >= @as(f32, @floatFromInt(b.y0)) and
+                @as(f32, @floatFromInt(c.y0)) + 2.0 <= b_y1);
+            const center_fit = dy_cy <= @max(4.0, b_h * 0.40);
+            if (ov_bot > ov_top and (same_baseline or descender_fit or center_fit)) {
+                const err = if (same_baseline) dy_base else @min(dy_base, dy_cy);
+                if (err < best_err) {
+                    best_err = err;
+                    best_bi = bi;
                 }
-                try b.indices.append(gpa, ci);
-                placed = true;
-                break;
             }
         }
-        if (!placed) {
+
+        if (best_bi) |idx_b| {
+            const b = &bands.items[idx_b];
+            if (c.x0 < b.x0) b.x0 = c.x0;
+            if (c.x1 > b.x1) b.x1 = c.x1;
+            if (c.y0 < b.y0 and (b.y1 - c.y0) <= 32) b.y0 = c.y0;
+            if (c.y1 > b.y1 and (c.y1 - b.y0) <= 32) b.y1 = c.y1;
+            if (ch <= 24) {
+                b.core_sum_cy += c_cy;
+                b.core_sum_y1 += c_y1;
+                b.core_sum_h += @floatFromInt(ch);
+                b.core_cnt += 1;
+            }
+            try b.indices.append(gpa, ci);
+        } else {
             var idxs = try std.ArrayList(usize).initCapacity(gpa, 32);
             try idxs.append(gpa, ci);
-            try bands.append(gpa, .{ .y0 = c.y0, .y1 = c.y1, .indices = idxs });
+            try bands.append(gpa, .{
+                .x0 = c.x0,
+                .x1 = c.x1,
+                .y0 = c.y0,
+                .y1 = c.y1,
+                .core_sum_cy = c_cy,
+                .core_sum_y1 = c_y1,
+                .core_sum_h = @floatFromInt(@min(ch, 24)),
+                .core_cnt = 1,
+                .indices = idxs,
+            });
+        }
+    }
+
+    // Pass 1b: Re-unify any split ascender/descender bands sharing horizontal x-overlap and near-identical baseline (<= 4px)
+    for (0..bands.items.len) |i| {
+        if (bands.items[i].merged) continue;
+        var j = i + 1;
+        while (j < bands.items.len) : (j += 1) {
+            if (bands.items[j].merged) continue;
+            const bi = &bands.items[i];
+            const bj = &bands.items[j];
+            if (bj.y0 > bi.y1 + 6) break;
+            const x_ov = @min(bi.x1, bj.x1) > @max(bi.x0, bj.x0);
+            if (!x_ov) continue;
+            const bi_y1 = bi.core_sum_y1 / @as(f32, @floatFromInt(bi.core_cnt));
+            const bj_y1 = bj.core_sum_y1 / @as(f32, @floatFromInt(bj.core_cnt));
+            if (@abs(bi_y1 - bj_y1) <= 4.0 and (@max(bi.y1, bj.y1) - @min(bi.y0, bj.y0)) <= 26) {
+                try bi.indices.appendSlice(gpa, bj.indices.items);
+                bi.x0 = @min(bi.x0, bj.x0);
+                bi.x1 = @max(bi.x1, bj.x1);
+                bi.y0 = @min(bi.y0, bj.y0);
+                bi.y1 = @max(bi.y1, bj.y1);
+                bi.core_sum_cy += bj.core_sum_cy;
+                bi.core_sum_y1 += bj.core_sum_y1;
+                bi.core_sum_h += bj.core_sum_h;
+                bi.core_cnt += bj.core_cnt;
+                bj.merged = true;
+            }
+        }
+    }
+
+    // Pass 2: Attach small components (accents, i-dots, hyphens, underscores, periods, commas) to nearest line band
+    for (small_indices.items) |ci| {
+        const c = comps.items[ci];
+        const c_cy = c.cy();
+        var best_bi: ?usize = null;
+        var best_dist: f32 = 1e9;
+        for (bands.items, 0..) |*b, bi| {
+            if (b.merged) continue;
+            if (c.y1 + 7 < b.y0 or c.y0 > b.y1 + 6) continue;
+            const b_cy: f32 = b.core_sum_cy / @as(f32, @floatFromInt(b.core_cnt));
+            const b_h: f32 = std.math.clamp(b.core_sum_h / @as(f32, @floatFromInt(b.core_cnt)), 6.0, 22.0);
+            const dist = @abs(c_cy - b_cy);
+            if (dist <= b_h * 1.05 + 5.0 and dist < best_dist) {
+                best_dist = dist;
+                best_bi = bi;
+            }
+        }
+        if (best_bi) |idx_b| {
+            try bands.items[idx_b].indices.append(gpa, ci);
         }
     }
 
@@ -705,7 +1100,7 @@ fn recognizeLines(
     defer tmp_u32.deinit(gpa);
 
     for (bands.items) |b| {
-        if (b.indices.items.len == 0) continue;
+        if (b.merged or b.indices.items.len == 0) continue;
         band_comps.clearRetainingCapacity();
         for (b.indices.items) |ci| {
             try band_comps.append(gpa, comps.items[ci]);
@@ -804,63 +1199,74 @@ fn recognizeLines(
             std.mem.sort(u32, bots.items, {}, u32Less);
             std.mem.sort(u32, tmp_u32.items, {}, u32Less);
 
-            const ref_top: f32 = @floatFromInt(tops.items[tops.items.len / 4]);
-            const ref_bot: f32 = @floatFromInt(bots.items[(bots.items.len * 3) / 4]);
+            const ref_top: f32 = @floatFromInt(tops.items[tops.items.len / 10]);
+            const ref_bot: f32 = @floatFromInt(bots.items[(bots.items.len * 3) / 5]);
             const ref_h: f32 = @max(6.0, ref_bot - ref_top);
             const med_w: f32 = @floatFromInt(tmp_u32.items[tmp_u32.items.len / 2]);
-            const space_gap: f32 = @max(3.0, @min(med_w * 0.48, ref_h * 0.34));
+            const space_gap: f32 = @max(3.1, @min(med_w * 0.50, ref_h * 0.35));
 
             phrase_buf.clearRetainingCapacity();
-            var matched = try std.ArrayList(MatchedGlyph).initCapacity(gpa, slice.len);
+            var matched = try std.ArrayList(MatchedGlyph).initCapacity(gpa, slice.len + 8);
             defer matched.deinit(gpa);
 
-            var score_sum: f32 = 0.0;
-            var min_score: f32 = 1.0;
-
+            const allow_split: u8 = if (slice.len >= 2) 0 else 2;
             for (slice, 0..) |g, gi| {
                 const gap: f32 = if (gi > 0 and g.x0 > slice[gi - 1].x1)
                     @floatFromInt(g.x0 - slice[gi - 1].x1)
                 else
                     0.0;
 
-                const q_vecs = extractGlyphVecs(fg, img.width, g.x0, g.y0, g.x1, g.y1);
-                const q_aspect = @as(f32, @floatFromInt(g.width())) / @as(f32, @floatFromInt(g.height()));
-                const q_y_top = (@as(f32, @floatFromInt(g.y0)) - ref_top) / ref_h;
-                const q_y_bot = (@as(f32, @floatFromInt(g.y1)) - ref_top) / ref_h;
-                const q_holes = countHolesGlyph(mask, img.width, g.x0, g.y0, g.x1, g.y1);
-
-                const m = matchGlyphSimd(templates, &q_vecs, q_aspect, q_y_top, q_y_bot, q_holes);
-                try matched.append(gpa, .{
-                    .cp = m.codepoint,
-                    .score = m.score,
-                    .second_cp = m.second_cp,
-                    .second_score = m.second_score,
-                    .gap_before = gap,
-                    .width = g.width(),
-                    .height = g.height(),
-                });
-
-                const clamped = std.math.clamp(m.score, 0.0, 1.0);
-                score_sum += clamped;
-                if (clamped < min_score) min_score = clamped;
+                try matchOrSplitGlyph(
+                    gpa,
+                    &matched,
+                    fg,
+                    mask,
+                    img.width,
+                    templates,
+                    g.x0,
+                    g.y0,
+                    g.x1,
+                    g.y1,
+                    gap,
+                    ref_top,
+                    ref_h,
+                    allow_split,
+                );
             }
 
             const char_cnt: u32 = @intCast(matched.items.len);
             if (char_cnt == 0) continue;
 
-            // Contextual disambiguation pass (1/i/l/I and 0/O/o within tokens)
+            var score_sum: f32 = 0.0;
+            var min_score: f32 = 1.0;
+            for (matched.items) |mg| {
+                const clamped = std.math.clamp(mg.score, 0.0, 1.0);
+                score_sum += clamped;
+                if (clamped < min_score) min_score = clamped;
+            }
+
+            // Contextual disambiguation pass (1/i/l/I, 0/O/o, í/i, and same-shape case within tokens)
             disambiguatePhrase(matched.items, space_gap);
 
             for (matched.items, 0..) |mg, gi| {
                 if (gi > 0) {
                     const prev_mg = matched.items[gi - 1];
                     const tight_punct = isTightRightPunct(mg.cp) or isTightLeftPunct(prev_mg.cp) or
-                        ((prev_mg.cp == '.' or prev_mg.cp == ':') and isAsciiDigit(mg.cp));
-                    const narrow_punct = (prev_mg.width <= 3 and prev_mg.height <= 8) or (mg.width <= 3 and mg.height <= 8);
-                    const eff_space_gap = if (tight_punct)
+                        ((prev_mg.cp == '.' or prev_mg.cp == ':') and isAsciiDigit(mg.cp)) or
+                        prev_mg.cp == '_' or mg.cp == '_';
+                    const is_bullet = prev_mg.cp == 0x00B7 or prev_mg.cp == 0x2022 or mg.cp == 0x00B7 or mg.cp == 0x2022;
+                    const narrow_punct = !is_bullet and ((prev_mg.width <= 3 and prev_mg.height <= 8) or (mg.width <= 3 and mg.height <= 8));
+                    const narrow_digit_1 = isAsciiDigit(prev_mg.cp) and isAsciiDigit(mg.cp) and (prev_mg.cp == '1' or mg.cp == '1');
+                    const narrow_pair = !is_bullet and ((prev_mg.width <= 3 and mg.width <= 3) or (med_w >= 7.0 and (prev_mg.width <= 3 or mg.width <= 3)));
+                    const is_ellipsis = (prev_mg.cp == '.' and mg.cp == '.');
+                    const eff_space_gap = if (is_ellipsis)
+                        space_gap * 2.3
+                    else if (tight_punct)
                         space_gap * 1.85
-                    else if (narrow_punct)
+                    else if (narrow_punct or narrow_digit_1)
                         space_gap * 1.45
+                    else if (narrow_pair)
+                        space_gap + 1.0
                     else
                         space_gap;
                     if (mg.gap_before >= eff_space_gap) {
@@ -875,7 +1281,7 @@ fn recognizeLines(
             const mean_score = score_sum / @as(f32, @floatFromInt(char_cnt));
             // Filter out non-text UI icon noise
             if (mean_score < 0.45) continue;
-            if (char_cnt == 1 and mean_score < 0.72) continue;
+            if (char_cnt == 1 and mean_score < 0.80) continue;
 
             const owned = try gpa.dupe(u8, phrase_buf.items);
             try lines_out.append(gpa, .{
@@ -1037,4 +1443,16 @@ test "disambiguatePhrase fixes 2O26 -> 2026 and sal1da -> salida" {
     };
     disambiguatePhrase(&word_tok, 4.0);
     try std.testing.expectEqual(@as(u32, 'i'), word_tok[3].cp);
+
+    var case_tok = [_]MatchedGlyph{
+        .{ .cp = 'B', .score = 0.9, .second_cp = '8', .second_score = 0.6, .gap_before = 0, .width = 7, .height = 11 },
+        .{ .cp = 'u', .score = 0.9, .second_cp = 'U', .second_score = 0.7, .gap_before = 1, .width = 6, .height = 8 },
+        .{ .cp = 'S', .score = 0.88, .second_cp = 's', .second_score = 0.86, .gap_before = 1, .width = 6, .height = 8 },
+        .{ .cp = 'C', .score = 0.88, .second_cp = 'c', .second_score = 0.86, .gap_before = 1, .width = 6, .height = 8 },
+        .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.7, .gap_before = 1, .width = 6, .height = 8 },
+        .{ .cp = 'r', .score = 0.9, .second_cp = 't', .second_score = 0.7, .gap_before = 1, .width = 4, .height = 8 },
+    };
+    disambiguatePhrase(&case_tok, 4.0);
+    try std.testing.expectEqual(@as(u32, 's'), case_tok[2].cp);
+    try std.testing.expectEqual(@as(u32, 'c'), case_tok[3].cp);
 }
