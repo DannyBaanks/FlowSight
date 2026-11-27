@@ -472,13 +472,14 @@ def _run_zig_ocr(
         }
 
     gray = Image.fromarray(rgb, mode='RGB').convert('L')
+    h, w = rgb.shape[:2]
+    pgm_bytes = f'P5\n{w} {h}\n255\n'.encode('ascii') + gray.tobytes()
     try:
-        with tempfile.NamedTemporaryFile(suffix='.pgm') as tf:
-            gray.save(tf.name, format='PPM')
-            proc = subprocess.run(
-                [bin_path, '--atlas', atlas_path, '--pgm', tf.name, '--min-conf', str(min_observed_conf)],
-                capture_output=True, text=True, timeout=timeout_s,
-            )
+        proc = subprocess.run(
+            [bin_path, '--atlas', atlas_path, '--pgm', '-', '--min-conf', str(min_observed_conf)],
+            input=pgm_bytes,
+            capture_output=True, timeout=timeout_s,
+        )
     except (OSError, subprocess.SubprocessError) as e:
         return {
             'status': OCR_ERROR,
@@ -492,6 +493,8 @@ def _run_zig_ocr(
             'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
         }
 
+    stdout_txt = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''
+    stderr_txt = proc.stderr.decode('utf-8', errors='replace') if proc.stderr else ''
     if proc.returncode != 0:
         return {
             'status': OCR_ERROR,
@@ -500,13 +503,13 @@ def _run_zig_ocr(
             'source_frame': source_frame,
             'lang': lang,
             'preprocessing': 'grayscale_pgm_p5',
-            'detail': (proc.stderr or proc.stdout or 'non-zero exit').strip()[:240],
+            'detail': (stderr_txt or stdout_txt or 'non-zero exit').strip()[:240],
             'items': [],
             'elapsed_ms': round((time.perf_counter() - t0) * 1000.0, 2),
         }
 
     try:
-        data = json.loads(proc.stdout)
+        data = json.loads(stdout_txt)
     except ValueError as e:
         return {
             'status': OCR_ERROR,
