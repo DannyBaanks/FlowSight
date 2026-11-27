@@ -117,6 +117,10 @@ def grade(q, a):
     if t == "exact_text":
         return (1, "exact") if norm(txt) in [norm(c) for c in cands] else (0, "no match")
     best = max(sim(txt, c) for c in cands)
+    # A verbose but correct answer must not lose to whole-string similarity:
+    # if every required token is present (and no forbidden claim, checked above), it is correct.
+    if q.get("required_tokens") and all(norm(r) in norm(txt) for r in q["required_tokens"]):
+        return 1, f"tokens ok (sim {best:.2f})"
     if "required_tokens" in q and not all(norm(r) in norm(txt) for r in q["required_tokens"]):
         best = min(best, q.get("partial_threshold", 0.5))
     if best >= q["threshold"]:
