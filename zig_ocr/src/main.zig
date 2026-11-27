@@ -1461,7 +1461,10 @@ fn disambiguatePhrase(glyphs: []MatchedGlyph, space_gap: f32, ref_top: f32, ref_
             const ref_h_col: f32 = @max(6.0, ref_bot - ref_top);
             const tall_like_i = ref_h_col >= 7.0 and @as(f32, @floatFromInt(g.height)) >= ref_h_col * 0.74;
             const second_is_i = (g.second_cp == 'i' and (g.score - g.second_score) <= 0.16);
-            if (second_is_i or (tall_like_i and g.width <= 4)) {
+            // A real colon is two dots separated by a gap (row_cov ~0.5-0.6); an 'i' whose dot split
+            // off still covers most rows. Without this guard 16px "key:value" read as "keyivalue".
+            const gapped_like_colon = g.row_cov < 0.75;
+            if (!gapped_like_colon and (second_is_i or (tall_like_i and g.width <= 4))) {
                 g.cp = 'i';
                 continue;
             }
@@ -2395,4 +2398,18 @@ test "split i stem read as ':' becomes 'i'; a real colon with a gap is kept" {
     };
     disambiguatePhrase(&kv, 3.2, 10.0, 21.0);
     try std.testing.expectEqual(@as(u32, ':'), kv[3].cp);
+}
+
+test "16px colon whose runner-up is 'i' stays ':' when its rows have a gap" {
+    // Liberation/Noto 16px "key:value": the colon spans >=74% of ref_h and 'i' is a close second,
+    // which rule 5b used to turn into "keyivalue". row_cov 0.6 = two dots with a gap.
+    var kv = [_]MatchedGlyph{
+        .{ .cp = 'e', .score = 0.9, .second_cp = 'c', .second_score = 0.6, .gap_before = 0, .width = 7, .height = 9 },
+        .{ .cp = 'y', .score = 0.9, .second_cp = 'v', .second_score = 0.6, .gap_before = 1, .width = 7, .height = 12 },
+        .{ .cp = ':', .score = 0.8, .second_cp = 'i', .second_score = 0.75, .gap_before = 1, .width = 2, .height = 9, .row_cov = 0.6 },
+        .{ .cp = 'v', .score = 0.9, .second_cp = 'V', .second_score = 0.6, .gap_before = 1, .width = 7, .height = 9 },
+        .{ .cp = 'a', .score = 0.9, .second_cp = 'o', .second_score = 0.6, .gap_before = 1, .width = 7, .height = 9 },
+    };
+    disambiguatePhrase(&kv, 3.6, 10.0, 21.0);
+    try std.testing.expectEqual(@as(u32, ':'), kv[2].cp);
 }
