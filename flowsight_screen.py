@@ -20,6 +20,7 @@ import argparse
 from dataclasses import dataclass, field
 import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -1226,6 +1227,219 @@ def _format_control_line(c: dict[str, Any]) -> str:
     )
 
 
+def _detect_graphic_regions_no_text(ctx: FilterContext) -> list[dict]:
+    """Identify large non-text graphic/banner regions (many NO_TEXT controls or high-chroma band with 0 OCR)."""
+    ocr_items = ctx.artifacts.get('ocr', {}).get('items', [])
+    controls = ctx.artifacts.get('controls', {}).get('controls', [])
+    if not controls:
+        return []
+
+    # Cluster NO_TEXT_EVIDENCE controls that sit in a horizontal band (e.g., pixel-art banner/mosaic)
+    no_txt = [
+        c for c in controls
+        if c.get('association') == focr.ASSOC_NONE and c.get('text') is None
+    ]
+    if len(no_txt) < 3:
+        return []
+
+    # Group NO_TEXT controls by vertical proximity (gap <= 60px)
+    no_txt_sorted = sorted(no_txt, key=lambda c: c['global_bbox'][1])
+    clusters: list[list[dict]] = []
+    for c in no_txt_sorted:
+        cy0, cy1 = c['global_bbox'][1], c['global_bbox'][3]
+        if clusters and cy0 <= max(x['global_bbox'][3] for x in clusters[-1]) + 50:
+            clusters[-1].append(c)
+        else:
+            clusters.append([c])
+
+    regions = []
+    for cl in clusters:
+        if len(cl) < 3:
+            continue
+        x0 = min(c['global_bbox'][0] for c in cl)
+        y0 = min(c['global_bbox'][1] for c in cl)
+        x1 = max(c['global_bbox'][2] for c in cl)
+        y1 = max(c['global_bbox'][3] for c in cl)
+        bw, bh = x1 - x0, y1 - y0
+        if bw < 260 or bh < 60:
+            continue
+        # Count OCR items strictly inside this region
+        inside_ocr = 0
+        for it in ocr_items:
+            ob = it['bbox']
+            ocx = (ob[0] + ob[2]) * 0.5
+            ocy = (ob[1] + ob[3]) * 0.5
+            if x0 <= ocx <= x1 and y0 <= ocy <= y1:
+                inside_ocr += 1
+        if inside_ocr <= 1:
+            regions.append({
+                'bbox': [x0, y0, x1, y1],
+                'size': [bw, bh],
+                'no_text_controls': len(cl),
+                'ocr_items': inside_ocr,
+            })
+    return regions
+
+
+def _detect_top_chrome_structure(ctx: FilterContext) -> dict | None:
+    """Infer a top window title bar + tab strip row using BOTH layout geometry AND visual chrome evidence.
+
+    Epistemic note: always reported as INFERRED (never DEMONSTRATED). Requires real visual evidence
+    of a tab strip (active-vs-inactive tab background contrast, or a continuous horizontal chrome
+    divider combined with vertical tab separators / close-button markers) so toolbar buttons
+    (e.g. 'Guardar' / 'Exportar') and form labels are NOT misclassified as tabs.
+    """
+    ocr_items = ctx.artifacts.get('ocr', {}).get('items', [])
+    if not ocr_items or ctx.rgb is None:
+        return None
+    h, w = ctx.rgb.shape[:2]
+    top_limit = max(140, int(h * 0.16))
+    top_items = [it for it in ocr_items if it['bbox'][1] < top_limit]
+    if len(top_items) < 2:
+        return None
+
+    # Exclude tiny single-char glyphs (w < 32) when forming candidate title/tab labels
+    chrome_items = [
+        it for it in top_items
+        if (it['bbox'][2] - it['bbox'][0]) >= 32 and len(it['text'].strip()) >= 3
+    ]
+    if len(chrome_items) < 2:
+        return None
+
+    # Cluster into horizontal rows by y-center within 16px
+    chrome_items.sort(key=lambda it: (it['bbox'][1] + it['bbox'][3]) * 0.5)
+    rows: list[list[dict]] = []
+    for it in chrome_items:
+        yc = (it['bbox'][1] + it['bbox'][3]) * 0.5
+        if rows:
+            prev_yc = sum((x['bbox'][1] + x['bbox'][3]) * 0.5 for x in rows[-1]) / len(rows[-1])
+            if abs(yc - prev_yc) <= 16.0:
+                rows[-1].append(it)
+                continue
+        rows.append([it])
+
+    # If the topmost row sits in the OS status bar (y < 26) and there are >=3 rows, skip it
+    if len(rows) >= 3:
+        r0_y = sum((x['bbox'][1] + x['bbox'][3]) * 0.5 for x in rows[0]) / len(rows[0])
+        if r0_y < 26.0:
+            rows = rows[1:]
+
+    if len(rows) < 2:
+        return None
+
+    title_row = rows[0]
+    tab_row = sorted(rows[1], key=lambda it: it['bbox'][0])
+    title_y = int(round(sum((x['bbox'][1] + x['bbox'][3]) * 0.5 for x in title_row) / len(title_row)))
+    tab_y = int(round(sum((x['bbox'][1] + x['bbox'][3]) * 0.5 for x in tab_row) / len(tab_row)))
+    if not (len(title_row) == 1 and len(tab_row) >= 2 and (tab_y - title_y) >= 18):
+        return None
+
+    gaps = [tab_row[i + 1]['bbox'][0] - tab_row[i]['bbox'][2] for i in range(len(tab_row) - 1)]
+    if not all(g >= 36 for g in gaps):
+        return None
+
+    # --- Visual chrome evidence check on ctx.rgb ---
+    gray = (
+        0.299 * ctx.rgb[:, :, 0].astype(np.float32)
+        + 0.587 * ctx.rgb[:, :, 1].astype(np.float32)
+        + 0.114 * ctx.rgb[:, :, 2].astype(np.float32)
+    )
+    tab_y0 = max(0, min(it['bbox'][1] for it in tab_row))
+    tab_y1 = min(h, max(it['bbox'][3] for it in tab_row))
+    band_y0 = max(0, tab_y0 - 6)
+    band_y1 = min(h, tab_y1 + 6)
+
+    # 1) Measure local background luma just above/below/beside each tab text (median avoids glyph pixels)
+    tab_bgs: list[float] = []
+    for it in tab_row:
+        bx0, by0, bx1, by1 = it['bbox']
+        sx0, sx1 = max(0, bx0 - 12), min(w, bx1 + 12)
+        sy0, sy1 = max(0, by0 - 5), min(h, by1 + 5)
+        patch = gray[sy0:sy1, sx0:sx1]
+        if patch.size == 0:
+            continue
+        tab_bgs.append(float(np.median(patch)))
+    bg_contrast = (max(tab_bgs) - min(tab_bgs)) if len(tab_bgs) >= 2 else 0.0
+
+    # 2) Check for a continuous horizontal chrome divider below the tab strip (separating chrome from content).
+    #    Must span >=75% of the row AND >=60% of the inter-tab gap so isolated toolbar button borders do not trigger it.
+    div_y0 = min(h - 2, tab_y1 + 1)
+    div_y1 = min(h - 1, tab_y1 + 18)
+    span_x0 = max(0, tab_row[0]['bbox'][0] - 24)
+    span_x1 = min(w, tab_row[-1]['bbox'][2] + 24)
+    has_horiz_divider = False
+    if div_y1 > div_y0 and span_x1 > span_x0 + 40:
+        vgrad = np.abs(gray[div_y0 + 1 : div_y1 + 1, span_x0:span_x1] - gray[div_y0:div_y1, span_x0:span_x1])
+        row_coverage = (vgrad >= 10.0).mean(axis=1)
+        if row_coverage.size > 0:
+            best_r = int(np.argmax(row_coverage))
+            if float(row_coverage[best_r]) >= 0.75:
+                # Verify the divider is also continuous across the inter-tab gap(s), not just under button boxes
+                gap_ok = True
+                for i in range(len(tab_row) - 1):
+                    gx0 = max(span_x0, tab_row[i]['bbox'][2] + 8)
+                    gx1 = min(span_x1, tab_row[i + 1]['bbox'][0] - 8)
+                    if gx1 > gx0 + 10:
+                        g_cov = float((vgrad[best_r, gx0 - span_x0 : gx1 - span_x0] >= 10.0).mean())
+                        if g_cov < 0.60:
+                            gap_ok = False
+                            break
+                has_horiz_divider = gap_ok
+
+    # 3) Check for vertical tab separator lines between adjacent tabs
+    has_vert_sep = False
+    if band_y1 > band_y0 + 6:
+        for i in range(len(tab_row) - 1):
+            gx0 = max(1, tab_row[i]['bbox'][2] + 4)
+            gx1 = min(w - 1, tab_row[i + 1]['bbox'][0] - 4)
+            if gx1 > gx0 + 2:
+                hgrad = np.abs(gray[band_y0:band_y1, gx0:gx1] - gray[band_y0:band_y1, gx0 - 1 : gx1 - 1])
+                col_cov = (hgrad >= 10.0).mean(axis=0)
+                if col_cov.size > 0 and float(col_cov.max()) >= 0.60:
+                    has_vert_sep = True
+                    break
+
+    # 4) Check for close-button ('x'/'×'/'✕') or new-tab ('+') glyph on the same horizontal row
+    has_tab_close_or_plus = False
+    for it in top_items:
+        txt = it['text'].strip()
+        yc = (it['bbox'][1] + it['bbox'][3]) * 0.5
+        if abs(yc - tab_y) <= 14.0 and txt in ('x', 'X', '×', '✕', '+'):
+            has_tab_close_or_plus = True
+            break
+
+    evidence: list[str] = []
+    if bg_contrast >= 8.0:
+        evidence.append(f'active_tab_bg_contrast={bg_contrast:.1f}')
+    if has_horiz_divider:
+        evidence.append('horiz_strip_divider')
+    if has_vert_sep:
+        evidence.append('vert_tab_separator')
+    if has_tab_close_or_plus:
+        evidence.append('close_or_plus_marker')
+
+    # Require genuine tab-strip visual evidence:
+    # - Active vs inactive tab background contrast (alone is strong tab-strip signal when divider/sep also present,
+    #   or contrast >= 12 luma between adjacent tab fills), OR
+    # - Continuous horizontal tab-strip divider combined with vertical separator or close/plus marker.
+    strong_visual = (
+        (bg_contrast >= 12.0)
+        or (bg_contrast >= 8.0 and (has_horiz_divider or has_vert_sep or has_tab_close_or_plus))
+        or (has_horiz_divider and (has_vert_sep or has_tab_close_or_plus))
+    )
+    if not strong_visual:
+        return None
+
+    return {
+        'title_y': title_y,
+        'title_text': title_row[0]['text'],
+        'tab_y': tab_y,
+        'tab_count': len(tab_row),
+        'tab_texts': [t['text'] for t in tab_row],
+        'evidence': evidence,
+    }
+
+
 def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500, ocr_limit: int = 25) -> str:
     total_ms = round(sum(t['ms'] for t in ctx.trace), 2)
     chain = ' -> '.join(f'{t["filter"]}({t["ms"]}ms)' for t in ctx.trace)
@@ -1285,6 +1499,25 @@ def format_pipeline_report(ctx: FilterContext, max_chars: int = 6500, ocr_limit:
                 out.append(f'  {a["ocr_id"]} text={a["text"]!r} bbox={a["bbox"]} reason={a["reason"]} candidates=[{c_str}]')
             if len(ambs) > 6:
                 out.append(f'  [TRUNCATED {len(ambs) - 6} of {len(ambs)} additional ambiguities]')
+
+    if 'ocr' in ctx.artifacts:
+        g_regions = _detect_graphic_regions_no_text(ctx)
+        if g_regions:
+            out.append('GRAPHIC REGIONS (NO READABLE TEXT — semantic content NOT_DEMONSTRATED without VLM):')
+            for gr in g_regions[:4]:
+                out.append(
+                    f'  bbox={gr["bbox"]} ({gr["size"][0]}x{gr["size"][1]}) '
+                    f'no_text_controls={gr["no_text_controls"]} ocr_items={gr["ocr_items"]} '
+                    '-> visual/graphic/pixel-art region; do NOT guess what it depicts'
+                )
+        chrome = _detect_top_chrome_structure(ctx)
+        if chrome:
+            ev_str = ','.join(chrome.get('evidence', []))
+            out.append(
+                f'TOP CHROME STRUCTURE (INFERRED — visual tab-strip heuristic, evidence=[{ev_str}]): '
+                f'window_title_bar_y={chrome["title_y"]} (1 title: {chrome["title_text"]!r}) | '
+                f'tab_strip_y={chrome["tab_y"]} ({chrome["tab_count"]} tabs: {chrome["tab_texts"]!r})'
+            )
 
     if 'ocr' in ctx.artifacts:
         oc = ctx.artifacts['ocr']
@@ -1435,6 +1668,10 @@ def main(argv=None) -> int:
     p.add_argument('--json', action='store_true', help='Emit structured JSON instead of compact text')
     p.add_argument('--max-chars', type=int, default=6500)
     p.add_argument('--ocr-limit', type=int, default=25, help='Maximum OCR items printed in report (default: 25, max: 400)')
+    p.add_argument('--ocr-backend', default=None, choices=['auto', 'zig', 'rapidocr', 'tesseract'],
+                   help='Override OCR backend when ocr filter is used')
+    p.add_argument('--one-shot', action='store_true',
+                   help='Single-call full-screen preset: theme,layout,controls,ocr(zig if built),ui_map with max_chars>=16000 and ocr_limit>=150')
     p.add_argument('--filters', action='store_true', help='List available filters and exit')
     p.add_argument('--enable-vlm', action='store_true', help='Opt-in enable crop-only vlm_probe (or set FLOWSIGHT_VLM_ENABLED=1)')
     p.add_argument('--vlm-url', default=None, help='OpenAI-compatible VLM endpoint URL (or FLOWSIGHT_VLM_URL)')
@@ -1456,7 +1693,18 @@ def main(argv=None) -> int:
             allow_remote=True if args.vlm_allow_remote else None,
             timeout_s=args.vlm_timeout,
         )
-        ctx = run_pipeline(args.input, vf=args.vf, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
+        vf_str = args.vf
+        max_chars = args.max_chars
+        ocr_limit = args.ocr_limit
+        if args.one_shot:
+            eff_b = args.ocr_backend or ('zig' if focr.detect_zig_ocr_engine()[0] else 'auto')
+            vf_str = f'theme,layout,controls,ocr=backend={eff_b},ui_map'
+            max_chars = max(max_chars, 16000)
+            ocr_limit = max(ocr_limit, 150)
+        elif args.ocr_backend and 'ocr' in vf_str:
+            vf_str = re.sub(r'\bocr(?=(?:,|$))', f'ocr=backend={args.ocr_backend}', vf_str)
+
+        ctx = run_pipeline(args.input, vf=vf_str, vlm_policy=vlm_policy, vlm_backend=vlm_backend)
         if args.json:
             payload = {
                 'schema': SCHEMA_SCREEN,
@@ -1469,7 +1717,7 @@ def main(argv=None) -> int:
             }
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
-            print(format_pipeline_report(ctx, max_chars=args.max_chars, ocr_limit=args.ocr_limit))
+            print(format_pipeline_report(ctx, max_chars=max_chars, ocr_limit=ocr_limit))
         return 0
     except (FilterDeny, fb.BlocksDeny, OSError) as e:
         print(f'DENY {e}', file=sys.stderr)

@@ -22,7 +22,10 @@ Pipeline determinista `-vf "f1=...,f2,..."` (OpenCV + NumPy + SciPy + Pillow) co
 - **`layout`** — divisores estructurales `H`/`V` y paneles `P0..Pn` con `area_pct`, fondo y pista posicional.
 - **`controls`** — detección geométrica de controles candidatos `W0..Wn` (botones acento, inputs, badges, tarjetas/modales) con `click=(cx, cy)`.
 - **`text_bands`** — detección geométrica de bandas de texto `T0..Tn` (sin OCR).
-- **`ocr`** ([`flowsight_ocr.py`](flowsight_ocr.py)) — **OCR local real en CPU sin red** (`backend=auto|tesseract|rapidocr`, usando `rapidocr-onnxruntime` PP-OCRv4 ONNX o `tesseract` si está instalado), con confianza y escala documentada (`OCR_OBSERVED` / `OCR_UNCERTAIN` / `OCR_ABSENT` fail-closed) + **asociación geométrica texto ↔ controles** (`TEXT_INSIDE`, `LABEL_ASSOCIATED`, `AMBIGUOUS_ASSOCIATION`, `NO_TEXT_EVIDENCE`) y métricas exactas `CER`/`WER`.
+- **`ocr`** ([`flowsight_ocr.py`](flowsight_ocr.py)) — **OCR local real en CPU sin red** (`backend=auto|zig|rapidocr|tesseract`), con confianza y escala documentada (`OCR_OBSERVED` / `OCR_UNCERTAIN` / `OCR_ABSENT` fail-closed) + **asociación geométrica texto ↔ controles** (`TEXT_INSIDE`, `LABEL_ASSOCIATED`, `AMBIGUOUS_ASSOCIATION`, `NO_TEXT_EVIDENCE`) y métricas exactas `CER`/`WER`:
+  - **`zig`** ([`zig_ocr/`](zig_ocr/)) — **Zig 0.16 SIMD Shape OCR** nativo para texto de interfaz de escritorio: atlas binario `FSOA v3` (`zig_ocr/build_atlas.py`), filtro grueso `4×8` → fino `12×16` SoA `i8` SIMD con workers paralelos por bandas, umbralización adaptativa por tile, separación por valles para glifos en contacto, compuerta de nitidez de bordes contra texturas suaves (cero alucinaciones en degradados/fotos) y worker persistente binario `--serve` (`FSQ1`).
+  - **`rapidocr` / `tesseract`** — backends alternativos (`rapidocr-onnxruntime` PP-OCRv4 ONNX o `tesseract` del sistema).
+- **Preset `--one-shot` y estructura de chrome superior** (`flowsight_screen.py`) — inspección de pantalla completa en **una sola llamada** (`theme,layout,controls,ocr(zig si está compilado),ui_map`, `max_chars>=16000`, `ocr_limit>=150`), con detección `TOP CHROME STRUCTURE` (distingue barra de título de ventana vs barra de pestañas) y marcado explícito de `GRAPHIC REGIONS (NO READABLE TEXT)` (`NOT_DEMONSTRATED`) para evitar conjeturas en zonas puramente gráficas.
 - **`ui_map`** — mapa wireframe ASCII compacto de divisores, controles y texto.
 - **`ui_diff=before.png`** ([`flowsight_diff.py`](flowsight_diff.py)) — **diff basado en identidad temporal** con asignación global óptima (`scipy.optimize.linear_sum_assignment`), tracks persistentes `track=K0..Kn` separados de los índices locales `W_i`, preservación de ambos frames y 9 clasificaciones (`NEW_CONTROL`, `REMOVED_CONTROL`, `MOVED_CONTROL`, `RESIZED_CONTROL`, `TEXT_CHANGED`, `COLOR_CHANGED`, `STATE_CHANGED_CANDIDATE` [`INFERRED`], `UNCHANGED_CONTROL`, `AMBIGUOUS_MATCH`).
 - **`vlm_probe`** ([`flowsight_vlm.py`](flowsight_vlm.py)) — escalación opcional a un VLM **apagada por defecto (fail-closed)**, estrictamente limitada a recortes (`crop=x:y:w:h` obligatorio, `<= 1024 px/lado`, `<= 512×512 px`), loopback por defecto (`allow_remote=False`), adaptador OpenAI-compatible en CLI (`--enable-vlm`) y MCP (`FLOWSIGHT_VLM_ENABLED=1`), salida siempre marcada `VLM_INFERRED`.
@@ -71,14 +74,18 @@ Expone **14 tools** (solo lectura sobre imágenes/videos; compatible con `mcp 2.
 
 ## Instalación rápida y uso CLI
 
-Requisitos: Python ≥3.10, `Pillow`, `numpy`, `opencv-python`, `scipy`, `mcp` (para el servidor MCP) y opcionalmente `rapidocr-onnxruntime` o `tesseract` para OCR local real.
+Requisitos: Python ≥3.10, `Pillow`, `numpy`, `opencv-python`, `scipy`, `mcp` (para el servidor MCP); opcionalmente **Zig 0.16** para compilar el backend nativo `zig_ocr` (recomendado para `--one-shot`), o `rapidocr-onnxruntime` / `tesseract` para OCR alternativo.
 
 ```bash
 python3 -m pip install -r requirements.txt
 
-# --- Capturas de pantalla estilo ffmpeg (M3/M4) ---
+# --- (Opcional, recomendado) Compilar backend nativo Zig 0.16 Shape OCR ---
+(cd zig_ocr && zig build -Doptimize=ReleaseFast && python3 build_atlas.py)
+
+# --- Capturas de pantalla estilo ffmpeg (M3/M4) y preset --one-shot ---
 python3 flowsight_screen.py --filters
-python3 flowsight_screen.py -i screen.png -vf "theme,layout,controls,text_bands,ocr,ui_map=48:20"
+python3 flowsight_screen.py -i screen.png --one-shot
+python3 flowsight_screen.py -i screen.png -vf "theme,layout,controls,text_bands,ocr,ui_map=48:20" --ocr-backend zig
 python3 flowsight_screen.py -i after.png  -vf "layout,controls,ocr,ui_diff=before.png"
 
 # Escalación VLM opt-in SOLO sobre recorte explícito (apagada por defecto)
@@ -114,11 +121,18 @@ python3 flowsight_corpus.py stats
 python3 flowsight_mcp.py
 ```
 
-### Ejecutar pruebas
+### Ejecutar pruebas y evaluación de OCR
 
 ```bash
-# Suite completa (con FLOW en PYTHONPATH se ejecutan también los gates nativos de VM)
+# Tests unitarios del motor nativo Zig OCR
+(cd zig_ocr && zig build test)
+
+# Suite Python (pytest o unittest; con FLOW en PYTHONPATH se ejecutan también los gates nativos de VM)
+pytest -q tests
 PYTHONPATH="/ruta/a/FLOW:." python3 -m unittest discover -s tests -v
+
+# Evaluación sintética de CER y rechazo de texturas del backend Zig OCR
+python3 bench/zig_ocr_eval.py -v
 ```
 
 ---
