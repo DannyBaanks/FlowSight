@@ -1101,6 +1101,7 @@ fn matchOrSplitGlyph(
     ref_top: f32,
     ref_h: f32,
     depth: u8,
+    allow_narrow: bool,
 ) !void {
     const bw = x1 - x0;
     const bh = y1 - y0;
@@ -1108,8 +1109,13 @@ fn matchOrSplitGlyph(
     const q_aspect = @as(f32, @floatFromInt(bw)) / @as(f32, @floatFromInt(bh));
 
     const is_wide_single = (single.codepoint == 'm' or single.codepoint == 'w' or single.codepoint == 'M' or single.codepoint == 'W');
-    const can_try_split = (depth < 2) and (bw >= 10) and (bh >= 5) and (bw <= 48) and (q_aspect >= 1.00) and
+    const can_try_wide_split = (bw >= 10) and (q_aspect >= 1.00) and
         ((!is_wide_single and single.score < 0.80) or (is_wide_single and single.score < 0.72));
+    // Narrow touching pairs ("ti" -> 'b', "fi" at 12-13px) never reach aspect 1.0; try them only
+    // when the single match is weak.
+    const narrow_split = allow_narrow and !can_try_wide_split and (bw >= 4) and (q_aspect >= 0.45) and single.score < 0.72;
+    const can_try_split = (depth < 2) and (bh >= 5) and (bw <= 48) and (can_try_wide_split or narrow_split);
+    const min_side: u32 = if (narrow_split) 2 else 3;
 
     if (can_try_split) {
         var col_sum: [48]u32 = .{0} ** 48;
@@ -1128,8 +1134,8 @@ fn matchOrSplitGlyph(
         var cand_val: [2]u32 = .{ std.math.maxInt(u32), std.math.maxInt(u32) };
         var cand_cnt: usize = 0;
 
-        var sx: u32 = 3;
-        while (sx + 3 <= bw) : (sx += 1) {
+        var sx: u32 = min_side;
+        while (sx + min_side <= bw) : (sx += 1) {
             var lmax: u32 = 0;
             for (0..sx) |lx| {
                 if (col_sum[lx] > lmax) lmax = col_sum[lx];
@@ -1203,8 +1209,8 @@ fn matchOrSplitGlyph(
         }
 
         if (best_split_x > x0) {
-            try matchOrSplitGlyph(gpa, out, fg, mask, img_w, atlas, x0, best_lb_y0, best_split_x, best_lb_y1, gap_before, ref_top, ref_h, depth + 1);
-            try matchOrSplitGlyph(gpa, out, fg, mask, img_w, atlas, best_split_x, best_rb_y0, x1, best_rb_y1, 0.0, ref_top, ref_h, depth + 1);
+            try matchOrSplitGlyph(gpa, out, fg, mask, img_w, atlas, x0, best_lb_y0, best_split_x, best_lb_y1, gap_before, ref_top, ref_h, depth + 1, allow_narrow);
+            try matchOrSplitGlyph(gpa, out, fg, mask, img_w, atlas, best_split_x, best_rb_y0, x1, best_rb_y1, 0.0, ref_top, ref_h, depth + 1, allow_narrow);
             return;
         }
     }
@@ -1673,6 +1679,32 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
                 }
             }
 
+            // Fixed pitch: glyph centre-to-centre advances are near-constant (mono cells). Proportional
+            // text mixes narrow (i, l, t) and wide (m, w) advances. Touching glyphs only occur in the latter.
+            var fixed_pitch = false;
+            {
+                tmp_u32.clearRetainingCapacity();
+                for (1..slice.len) |gi| {
+                    const ga = slice[gi - 1];
+                    const gb = slice[gi];
+                    if (gb.x0 <= ga.x1 or gb.x0 - ga.x1 > 6) continue;
+                    if (ga.height() < 5 or gb.height() < 5) continue;
+                    tmp_u32.append(gpa, (gb.x0 + gb.x1) - (ga.x0 + ga.x1)) catch return;
+                }
+                if (tmp_u32.items.len >= 5) {
+                    std.mem.sort(u32, tmp_u32.items, {}, u32Less);
+                    // Advances are in doubled px (sum of x0+x1); +-1.5px rasterisation jitter. Word
+                    // spaces add a tail of longer advances, so count how many sit at the median pitch.
+                    const p50 = tmp_u32.items[tmp_u32.items.len / 2];
+                    var at_pitch: usize = 0;
+                    for (tmp_u32.items) |adv| {
+                        const d = if (adv > p50) adv - p50 else p50 - adv;
+                        if (d <= 3) at_pitch += 1;
+                    }
+                    fixed_pitch = at_pitch * 10 >= tmp_u32.items.len * 7;
+                }
+            }
+
             phrase_buf.clearRetainingCapacity();
             matched.clearRetainingCapacity();
 
@@ -1698,6 +1730,7 @@ fn bandWorkerRun(ctx: *BandWorkerCtx) void {
                     ref_top,
                     ref_h,
                     allow_split,
+                    !fixed_pitch,
                 ) catch return;
             }
 
