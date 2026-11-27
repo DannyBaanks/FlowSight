@@ -1192,7 +1192,38 @@ fn matchOrSplitGlyph(
             const rb = trimVerticalBounds(fg, img_w, split_x, y0, x1, y1);
             if (lb.ok and rb.ok and (lb.y1 - lb.y0) >= 2 and (rb.y1 - rb.y0) >= 2) {
                 const lm = matchBox(fg, mask, img_w, atlas, x0, lb.y0, split_x, lb.y1, ref_top, ref_h);
-                const rm = matchBox(fg, mask, img_w, atlas, split_x, rb.y0, x1, rb.y1, ref_top, ref_h);
+                var rb_y0 = rb.y0;
+                var rm = matchBox(fg, mask, img_w, atlas, split_x, rb_y0, x1, rb.y1, ref_top, ref_h);
+                // When a left glyph overhangs the split edge (f+o -> fÓ/fó, C+o -> Có, V+a -> Vá),
+                // 1-2px of its upper tip stays in the leftmost 2 columns of the right box and mimics
+                // an acute accent. Trim top rows whose ink lies solely in [split_x, split_x+2) if
+                // re-matching the trimmed box scores higher (real accents sit over the body).
+                const is_accented_vowel = switch (rm.codepoint) {
+                    0x00E1, 0x00E9, 0x00ED, 0x00F3, 0x00FA, 0x00C1, 0x00C9, 0x00CD, 0x00D3, 0x00DA => true,
+                    else => false,
+                };
+                if (is_accented_vowel and (x1 - split_x) >= 4 and (rb.y1 - rb.y0) >= 6) {
+                    var trim_y = rb.y0;
+                    while (trim_y + 4 < rb.y1) : (trim_y += 1) {
+                        const row_off = @as(usize, trim_y) * @as(usize, img_w);
+                        var has_body_ink = false;
+                        var tx = split_x + 2;
+                        while (tx < x1) : (tx += 1) {
+                            if (fg[row_off + tx] >= 36) {
+                                has_body_ink = true;
+                                break;
+                            }
+                        }
+                        if (has_body_ink) break;
+                    }
+                    if (trim_y > rb.y0 and (rb.y1 - trim_y) >= 4) {
+                        const rm2 = matchBox(fg, mask, img_w, atlas, split_x, trim_y, x1, rb.y1, ref_top, ref_h);
+                        if (rm2.score > rm.score) {
+                            rb_y0 = trim_y;
+                            rm = rm2;
+                        }
+                    }
+                }
                 const mean_lr = (lm.score + rm.score) * 0.5;
                 const min_lr = @min(lm.score, rm.score);
                 const lw = split_x - x0;
@@ -1212,7 +1243,7 @@ fn matchOrSplitGlyph(
                     best_split_x = split_x;
                     best_lb_y0 = lb.y0;
                     best_lb_y1 = lb.y1;
-                    best_rb_y0 = rb.y0;
+                    best_rb_y0 = rb_y0;
                     best_rb_y1 = rb.y1;
                 }
             }
